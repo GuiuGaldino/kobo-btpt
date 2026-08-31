@@ -1,9 +1,12 @@
 name: Build kobo-btpt PR32
+
 on:
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -11,8 +14,16 @@ jobs:
           repository: pgaskin/kobo-btpt
           ref: update-nh
           submodules: recursive
-      - name: Build
-        run: make clean all koboroot
+
+      - name: Build with NickelTC
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            -w /src \
+            --entrypoint make \
+            geek1011/nickeltc \
+            clean all koboroot
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
