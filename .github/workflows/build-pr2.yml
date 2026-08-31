@@ -1,4 +1,4 @@
-name: Build kobo-btpt 4.45 debug
+name: Build kobo-btpt single-double
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
           ref: update-nh
           submodules: recursive
 
-      - name: Patch for Kobo 4.45 with debug
+      - name: Patch Kobo 4.45 and single-double click
         shell: python
         run: |
           from pathlib import Path
@@ -31,19 +31,10 @@ jobs:
               b = text.index(end, a)
               return text[:a] + replacement + text[b:]
 
-          # ------------------------------------------------------------
-          # Add stdarg support for debugLog().
-          # ------------------------------------------------------------
-          cc = cc.replace(
-              "#include <stdio.h>",
-              "#include <stdio.h>\n#include <stdarg.h>",
-              1
-          )
+          # ============================================================
+          # Compatibility fix for Kobo firmware 4.45
+          # ============================================================
 
-          # ------------------------------------------------------------
-          # Remove fragile private Nickel symbols.
-          # Keep only MainWindowController.
-          # ------------------------------------------------------------
           start = "/* Stop Bluetooth heartbeat after this many seconds of inactivity */"
           end = "static void invokeMainWindowController"
 
@@ -54,121 +45,22 @@ jobs:
               """static void *(*MainWindowController_sharedInstance)();
           static QWidget *(*MainWindowController_currentView)(void *);
 
-          static void debugLog(const char *fmt, ...)
+          static long long monotonicMilliseconds()
           {
-              FILE *f = fopen("/mnt/onboard/btpt-debug.txt", "a");
-              if (!f) {
-                  return;
-              }
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
 
-              va_list args;
-              va_start(args, fmt);
-              vfprintf(f, fmt, args);
-              va_end(args);
-
-              fputc('\\n', f);
-              fclose(f);
+              return ((long long)ts.tv_sec * 1000LL)
+                  + ((long long)ts.tv_nsec / 1000000LL);
           }
 
           """
           )
 
-          # ------------------------------------------------------------
-          # Add diagnostics when trying to add a device.
-          # ------------------------------------------------------------
-          old = """{
-              int fd;"""
+          # ============================================================
+          # Simplify beginning of run() and add click state
+          # ============================================================
 
-          # Source uses tabs, so handle that form too.
-          if old not in cc:
-              old = """{
-          \tint fd;"""
-
-          new = """{
-              debugLog(
-                  "addDevice name='%s' uniq='%s' handler='%s'",
-                  name.toUtf8().constData(),
-                  uniq.toUtf8().constData(),
-                  handler.toUtf8().constData()
-              );
-
-              int fd;"""
-
-          assert old in cc, "Could not patch addDevice start"
-          cc = cc.replace(old, new, 1)
-
-          # ------------------------------------------------------------
-          # Log which configuration filename is selected.
-          # ------------------------------------------------------------
-          old = """\tif (!cfg.open(QIODevice::ReadOnly | QIODevice::Text)) {"""
-
-          new = """\tdebugLog(
-          \t\t"trying config '%s'",
-          \t\tcfg.fileName().toUtf8().constData()
-          \t);
-
-          \tif (!cfg.open(QIODevice::ReadOnly | QIODevice::Text)) {
-          \t\tdebugLog(
-          \t\t\t"CONFIG OPEN FAILED '%s'",
-          \t\t\tcfg.fileName().toUtf8().constData()
-          \t\t);"""
-
-          assert old in cc, "Could not patch config open"
-          cc = cc.replace(old, new, 1)
-
-          # ------------------------------------------------------------
-          # Log successfully acquired device.
-          # ------------------------------------------------------------
-          old = """\tnh_log("acquired device %s: %s","""
-
-          new = """\tdebugLog(
-          \t\t"DEVICE ACQUIRED handler='%s' uniq='%s' config='%s'",
-          \t\thandler.toUtf8().constData(),
-          \t\tuniq.toUtf8().constData(),
-          \t\tcfg.fileName().toUtf8().constData()
-          \t);
-
-          \tnh_log("acquired device %s: %s","""
-
-          assert old in cc, "Could not patch acquired device"
-          cc = cc.replace(old, new, 1)
-
-          # ------------------------------------------------------------
-          # Log every input-device scan.
-          # ------------------------------------------------------------
-          old = """\tnh_log("checking /proc/bus/input/devices for new devices");"""
-
-          new = """\tnh_log("checking /proc/bus/input/devices for new devices");
-          \tdebugLog("SCAN /proc/bus/input/devices");"""
-
-          assert old in cc, "Could not patch scan logging"
-          cc = cc.replace(old, new, 1)
-
-          # ------------------------------------------------------------
-          # Log each input entry when its handlers are encountered.
-          # This tells us bus/name/address/handlers.
-          # ------------------------------------------------------------
-          old = """\t\telse if (type == "H") {
-          \t\t\t/* Skip if not Bluetooth device */"""
-
-          new = """\t\telse if (type == "H") {
-          \t\t\tdebugLog(
-          \t\t\t\t"INPUT i='%s' name='%s' uniq='%s' handlers='%s'",
-          \t\t\t\ti.toUtf8().constData(),
-          \t\t\t\tn.toUtf8().constData(),
-          \t\t\t\tu.toUtf8().constData(),
-          \t\t\t\tline.toUtf8().constData()
-          \t\t\t);
-
-          \t\t\t/* Skip if not Bluetooth device */"""
-
-          assert old in cc, "Could not patch input-device logging"
-          cc = cc.replace(old, new, 1)
-
-          # ------------------------------------------------------------
-          # Simplify BluetoothPageTurner::run().
-          # Removes old heartbeat state.
-          # ------------------------------------------------------------
           start = "void BluetoothPageTurner::run()\n{"
           end = '\tnh_log("starting");'
 
@@ -181,28 +73,32 @@ jobs:
               fd_set rfds;
               struct timeval tv;
 
+              bool pendingSingleClick = false;
+              long long singleClickDeadline = 0;
+
+              const long long DOUBLE_CLICK_MS = 300;
+
           """
           )
 
-          # ------------------------------------------------------------
-          # Initial scan: fixes devices already connected at startup.
-          # ------------------------------------------------------------
+          # ============================================================
+          # Detect devices already connected when plugin starts
+          # ============================================================
+
           old = 'watcher.addPath("/dev/input");'
 
           new = '''watcher.addPath("/dev/input");
 
-              debugLog("watching /dev/input");
-              debugLog("performing initial device scan");
-
-              /* Scan devices which were already connected at startup */
+              /* Detect devices already connected at startup */
               scanDevices();'''
 
-          assert old in cc, "Could not find watcher.addPath"
+          assert old in cc
           cc = cc.replace(old, new, 1)
 
-          # ------------------------------------------------------------
-          # Remove Bluetooth heartbeat.
-          # ------------------------------------------------------------
+          # ============================================================
+          # Remove obsolete BluetoothHeartbeat section
+          # ============================================================
+
           start = "\t\t/* Bluetooth heartbeat to prevent Bluetooth from turning off */"
           end = "\t\t/* Poll devices for input events */"
 
@@ -213,9 +109,50 @@ jobs:
               ""
           )
 
-          # ------------------------------------------------------------
-          # Remove PowerManager handling.
-          # ------------------------------------------------------------
+          # ============================================================
+          # Replace polling timeout.
+          #
+          # Normally wait up to 1 second.
+          # If a single click is pending, wake when its 300 ms deadline
+          # expires so nextPage can be sent.
+          # ============================================================
+
+          old = """\t\ttv.tv_sec = 1;
+          \t\ttv.tv_usec = 0;"""
+
+          new = """\t\tlong long nowMs = monotonicMilliseconds();
+
+          \t\tif (pendingSingleClick &&
+          \t\t    nowMs >= singleClickDeadline) {
+          \t\t\tinvokeMainWindowController("nextPage");
+          \t\t\tpendingSingleClick = false;
+          \t\t}
+
+          \t\tif (pendingSingleClick) {
+          \t\t\tlong long remaining =
+          \t\t\t\tsingleClickDeadline -
+          \t\t\t\tmonotonicMilliseconds();
+
+          \t\t\tif (remaining < 0) {
+          \t\t\t\tremaining = 0;
+          \t\t\t}
+
+          \t\t\ttv.tv_sec = remaining / 1000;
+          \t\t\ttv.tv_usec =
+          \t\t\t\t(remaining % 1000) * 1000;
+          \t\t}
+          \t\telse {
+          \t\t\ttv.tv_sec = 1;
+          \t\t\ttv.tv_usec = 0;
+          \t\t}"""
+
+          assert old in cc
+          cc = cc.replace(old, new, 1)
+
+          # ============================================================
+          # Remove old PowerManager / heartbeat action when event matches
+          # ============================================================
+
           start = "\t\t\t\t\t/* Update Bluetooth heartbeat time */"
           end = "\t\t\t\t\t/* Invoke the configured method */"
 
@@ -226,52 +163,59 @@ jobs:
               ""
           )
 
-          # ------------------------------------------------------------
-          # Log EVERY raw input event received from acquired devices.
-          # ------------------------------------------------------------
-          old = """\t\t\tif (e.type == 0x00 &&
-          \t\t\t    e.code == 0x00 &&
-          \t\t\t    e.value == 0x0001) {"""
+          # ============================================================
+          # Replace method invocation with single/double-click support
+          # ============================================================
 
-          new = """\t\t\tdebugLog(
-          \t\t\t\t"EVENT type=%u code=%u value=%d",
-          \t\t\t\t(unsigned)e.type,
-          \t\t\t\t(unsigned)e.code,
-          \t\t\t\t(int)e.value
-          \t\t\t);
-
-          \t\t\tif (e.type == 0x00 &&
-          \t\t\t    e.code == 0x00 &&
-          \t\t\t    e.value == 0x0001) {"""
-
-          assert old in cc, "Could not patch event logging"
-          cc = cc.replace(old, new, 1)
-
-          # ------------------------------------------------------------
-          # Fix temporary c_str pointer.
-          # ------------------------------------------------------------
           old = """\t\t\t\t\tconst char *method = pair.second
           \t\t\t\t\t\t.toStdString().c_str();
           \t\t\t\t\tinvokeMainWindowController(method);"""
 
-          new = """\t\t\t\t\tQByteArray method = pair.second.toUtf8();
+          new = """\t\t\t\t\tQByteArray method =
+          \t\t\t\t\t\tpair.second.toUtf8();
 
-          \t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t"MATCH method='%s' type=%u code=%u value=%d",
-          \t\t\t\t\t\tmethod.constData(),
-          \t\t\t\t\t\t(unsigned)e.type,
-          \t\t\t\t\t\t(unsigned)e.code,
-          \t\t\t\t\t\t(int)e.value
-          \t\t\t\t\t);
+          \t\t\t\t\tif (method == "singleDouble") {
+          \t\t\t\t\t\tlong long clickTime =
+          \t\t\t\t\t\t\tmonotonicMilliseconds();
 
-          \t\t\t\t\tinvokeMainWindowController(method.constData());"""
+          \t\t\t\t\t\tif (pendingSingleClick &&
+          \t\t\t\t\t\t    clickTime <=
+          \t\t\t\t\t\t    singleClickDeadline) {
 
-          assert old in cc, "Could not patch method invocation"
+          \t\t\t\t\t\t\t/*
+          \t\t\t\t\t\t\t * Second click arrived inside
+          \t\t\t\t\t\t\t * the double-click window.
+          \t\t\t\t\t\t\t */
+          \t\t\t\t\t\t\tpendingSingleClick = false;
+
+          \t\t\t\t\t\t\tinvokeMainWindowController(
+          \t\t\t\t\t\t\t\t"prevPage");
+          \t\t\t\t\t\t}
+          \t\t\t\t\t\telse {
+          \t\t\t\t\t\t\t/*
+          \t\t\t\t\t\t\t * First click. Delay nextPage
+          \t\t\t\t\t\t\t * until we know whether a
+          \t\t\t\t\t\t\t * second click arrives.
+          \t\t\t\t\t\t\t */
+          \t\t\t\t\t\t\tpendingSingleClick = true;
+
+          \t\t\t\t\t\t\tsingleClickDeadline =
+          \t\t\t\t\t\t\t\tclickTime +
+          \t\t\t\t\t\t\t\tDOUBLE_CLICK_MS;
+          \t\t\t\t\t\t}
+          \t\t\t\t\t}
+          \t\t\t\t\telse {
+          \t\t\t\t\t\tinvokeMainWindowController(
+          \t\t\t\t\t\t\tmethod.constData());
+          \t\t\t\t\t}"""
+
+          assert old in cc, "Could not find method invocation"
           cc = cc.replace(old, new, 1)
 
-          # ------------------------------------------------------------
-          # Remove TimeLastUsedUpdater implementation.
-          # ------------------------------------------------------------
+          # ============================================================
+          # Remove TimeLastUsedUpdater
+          # ============================================================
+
           start = "void TimeLastUsedUpdater::notify()"
           end = "static int btpt_init()"
 
@@ -282,9 +226,10 @@ jobs:
               ""
           )
 
-          # ------------------------------------------------------------
-          # Minimal btpt_init + reset debug file on every Nickel startup.
-          # ------------------------------------------------------------
+          # ============================================================
+          # Minimal btpt_init compatible with firmware 4.45
+          # ============================================================
+
           start = "static int btpt_init()"
           end = "static struct nh_info btpt_info"
 
@@ -296,21 +241,19 @@ jobs:
           {
               mkdir(BTPT_DIR, 0755);
 
-              FILE *marker = fopen("/mnt/onboard/btpt-loaded.txt", "w");
+              FILE *marker =
+                  fopen("/mnt/onboard/btpt-loaded.txt", "w");
+
               if (marker) {
-                  fputs("kobo-btpt init reached\\n", marker);
+                  fputs(
+                      "kobo-btpt single-double loaded\\n",
+                      marker
+                  );
                   fclose(marker);
               }
 
-              FILE *debug = fopen("/mnt/onboard/btpt-debug.txt", "w");
-              if (debug) {
-                  fputs("=== kobo-btpt debug start ===\\n", debug);
-                  fclose(debug);
-              }
-
-              debugLog("btpt_init reached");
-
-              BluetoothPageTurner *btpt = new BluetoothPageTurner();
+              BluetoothPageTurner *btpt =
+                  new BluetoothPageTurner();
 
               QObject::connect(
                   btpt,
@@ -321,17 +264,16 @@ jobs:
 
               btpt->start();
 
-              debugLog("BluetoothPageTurner thread started");
-
               return 0;
           }
 
           """
           )
 
-          # ------------------------------------------------------------
-          # Keep only MainWindowController dlsym symbols.
-          # ------------------------------------------------------------
+          # ============================================================
+          # Keep only MainWindowController symbols
+          # ============================================================
+
           start = "static struct nh_dlsym btpt_dlsym[] = {"
           end = "NickelHook("
 
@@ -341,12 +283,20 @@ jobs:
               end,
               """static struct nh_dlsym btpt_dlsym[] = {
               {
-                  .name = "_ZN20MainWindowController14sharedInstanceEv",
-                  .out = nh_symoutptr(MainWindowController_sharedInstance)
+                  .name =
+                      "_ZN20MainWindowController14sharedInstanceEv",
+                  .out =
+                      nh_symoutptr(
+                          MainWindowController_sharedInstance
+                      )
               },
               {
-                  .name = "_ZNK20MainWindowController11currentViewEv",
-                  .out = nh_symoutptr(MainWindowController_currentView)
+                  .name =
+                      "_ZNK20MainWindowController11currentViewEv",
+                  .out =
+                      nh_symoutptr(
+                          MainWindowController_currentView
+                      )
               },
               {0},
           };
@@ -354,9 +304,10 @@ jobs:
           """
           )
 
-          # ------------------------------------------------------------
-          # Simplify header to remove TimeLastUsedUpdater and notify signal.
-          # ------------------------------------------------------------
+          # ============================================================
+          # Simplify header
+          # ============================================================
+
           start = "class BluetoothPageTurner : public QThread"
           end = "#endif /* BTPT_H */"
 
@@ -394,7 +345,9 @@ jobs:
           cc_path.write_text(cc)
           h_path.write_text(h)
 
-          print("=== Checking patch ===")
+          # ============================================================
+          # Verify patch
+          # ============================================================
 
           forbidden = [
               "BluetoothHeartbeat",
@@ -406,22 +359,26 @@ jobs:
               "bluetoothHeartbeat",
           ]
 
+          print("=== Checking patch ===")
+
           for item in forbidden:
               print(
                   item,
                   "FOUND" if item in cc else "removed"
               )
 
-          assert all(item not in cc for item in forbidden)
+          for item in forbidden:
+              assert item not in cc
+
+          assert "singleDouble" in cc
+          assert "DOUBLE_CLICK_MS = 300" in cc
+          assert 'invokeMainWindowController("nextPage")' in cc
+          assert '"prevPage"' in cc
           assert "TimeLastUsedUpdater" not in h
-          assert "void notify();" not in h
 
-          assert "btpt-debug.txt" in cc
-          assert "EVENT type=%u code=%u value=%d" in cc
-          assert "performing initial device scan" in cc
-
-          print("debug logging: OK")
-          print("initial scan: OK")
+          print("single click -> nextPage: OK")
+          print("double click -> prevPage: OK")
+          print("double-click window: 300 ms")
           print("Patch OK")
 
       - name: Fix Linux input header
@@ -433,7 +390,9 @@ jobs:
             ghcr.io/pgaskin/nickeltc:1.0 \
             -c 'cp /usr/include/linux/input-event-codes.h src/input-event-codes.h'
 
-          sed -i 's|<linux/input-event-codes.h>|"input-event-codes.h"|' src/eventcodes.cc
+          sed -i \
+            's|<linux/input-event-codes.h>|"input-event-codes.h"|' \
+            src/eventcodes.cc
 
       - name: Build with NickelTC
         run: |
@@ -452,5 +411,5 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kobo-btpt-445-debug
+          name: kobo-btpt-single-double
           path: KoboRoot.tgz
