@@ -20,9 +20,20 @@ jobs:
           docker run --rm \
             -v "$PWD:/src" \
             -w /src \
-            --entrypoint make \
+            --entrypoint bash \
             ghcr.io/pgaskin/nickeltc:1 \
-            clean all koboroot
+            -lc '
+              SYSROOT="$(arm-nickel-linux-gnueabihf-g++ -print-sysroot)"
+              echo "Nickel sysroot: $SYSROOT"
+              mkdir -p "$SYSROOT/usr/include/linux"
+              cp /usr/include/linux/input-event-codes.h "$SYSROOT/usr/include/linux/input-event-codes.h"
+              make clean all koboroot
+            '
+
+      - name: Verify KoboRoot
+        run: |
+          ls -lh KoboRoot.tgz
+          test -f KoboRoot.tgz
 
       - name: Upload
         uses: actions/upload-artifact@v4
