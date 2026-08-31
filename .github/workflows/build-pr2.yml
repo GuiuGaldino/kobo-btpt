@@ -1,4 +1,4 @@
-name: Build kobo-btpt PR32
+name: Build kobo-btpt 4.45 diagnostic
 
 on:
   workflow_dispatch:
@@ -15,7 +15,173 @@ jobs:
           ref: update-nh
           submodules: recursive
 
-      - name: Fix input-event-codes header
+      - name: Patch for Kobo 4.45
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          cc_path = Path("src/btpt.cc")
+          h_path = Path("src/btpt.h")
+
+          cc = cc_path.read_text()
+          h = h_path.read_text()
+
+          # Remove BluetoothHeartbeat / PowerManager / TimeEvent symbols.
+          cc = cc.replace(
+          '''/* Stop Bluetooth heartbeat after this many seconds of inactivity */
+          #define BLUETOOTH_TIMEOUT (10*60)
+
+          static void *(*BluetoothHeartbeat)(void *, long long);
+          static void (*BluetoothHeartbeat_beat)(void *);
+
+          static void *(*MainWindowController_sharedInstance)();
+          static QWidget *(*MainWindowController_currentView)(void *);
+          static QObject *(*PowerManager_sharedInstance)();
+          static int (*PowerManager_filter)(QObject *, QObject *, QEvent *);
+          static QEvent::Type (*TimeEvent_eventType)();
+          ''',
+          '''static void *(*MainWindowController_sharedInstance)();
+          static QWidget *(*MainWindowController_currentView)(void *);
+          '''
+          )
+
+          # Remove heartbeat state from run().
+          cc = cc.replace(
+          '''\tvoid *bluetoothHeartbeat = NULL;
+          \tfd_set rfds;
+          \tstruct timeval tv;
+          \tstruct timespec last_event = { 0 };
+          \tstruct timespec now = { 0 };
+          ''',
+          '''\tfd_set rfds;
+          \tstruct timeval tv;
+          '''
+          )
+
+          # Remove heartbeat block.
+          cc = re.sub(
+              r'\n\t\t/\* Bluetooth heartbeat to prevent Bluetooth from turning off \*/'
+              r'.*?'
+              r'\n\t\t/\* Poll devices for input events \*/',
+              '\n\n\t\t/* Poll devices for input events */',
+              cc,
+              flags=re.S,
+          )
+
+          # Remove heartbeat timestamp + PowerManager notify.
+          cc = re.sub(
+              r'\n\t\t\t\t\t/\* Update Bluetooth heartbeat time \*/'
+              r'.*?'
+              r'\n\t\t\t\t\t/\* Invoke the configured method \*/',
+              '\n\t\t\t\t\t/* Invoke the configured method */',
+              cc,
+              flags=re.S,
+          )
+
+          # Fix dangling c_str pointer while we're here.
+          cc = cc.replace(
+          '''\t\t\t\t\tconst char *method = pair.second
+          \t\t\t\t\t\t.toStdString().c_str();
+          \t\t\t\t\tinvokeMainWindowController(method);
+          ''',
+          '''\t\t\t\t\tQByteArray method = pair.second.toUtf8();
+          \t\t\t\t\tinvokeMainWindowController(method.constData());
+          '''
+          )
+
+          # Remove TimeLastUsedUpdater::notify implementation.
+          cc = re.sub(
+              r'\nvoid TimeLastUsedUpdater::notify\(\)\n\{.*?\n\}\n'
+              r'(?=static int btpt_init\(\))',
+              '\n',
+              cc,
+              flags=re.S,
+          )
+
+          # Replace init. This creates a visible marker if the plugin gets here.
+          cc = re.sub(
+              r'static int btpt_init\(\)\n\{.*?\n\}\n'
+              r'(?=\nstatic struct nh_info)',
+              '''static int btpt_init()
+          {
+          \tmkdir(BTPT_DIR, 0755);
+
+          \tFILE *marker = fopen("/mnt/onboard/btpt-loaded.txt", "w");
+          \tif (marker) {
+          \t\tfputs("kobo-btpt init reached\\\\n", marker);
+          \t\tfclose(marker);
+          \t}
+
+          \tBluetoothPageTurner *btpt = new BluetoothPageTurner();
+          \tQObject::connect(
+          \t\tbtpt, &QThread::finished,
+          \t\tbtpt, &QObject::deleteLater);
+          \tbtpt->start();
+
+          \treturn 0;
+          }
+          ''',
+              cc,
+              flags=re.S,
+          )
+
+          # Keep only the two MainWindowController symbols.
+          cc = re.sub(
+              r'static struct nh_dlsym btpt_dlsym\[\] = \{.*?\n\};'
+              r'(?=\nNickelHook)',
+              '''static struct nh_dlsym btpt_dlsym[] = {
+          \t{
+          \t\t.name = "_ZN20MainWindowController14sharedInstanceEv",
+          \t\t.out = nh_symoutptr(MainWindowController_sharedInstance)
+          \t},
+          \t{
+          \t\t.name = "_ZNK20MainWindowController11currentViewEv",
+          \t\t.out = nh_symoutptr(MainWindowController_currentView)
+          \t},
+          \t{0},
+          };''',
+              cc,
+              flags=re.S,
+          )
+
+          # Remove unused signal/updater class from header.
+          h = h.replace(
+          '''signals:
+          \tvoid notify();
+          };
+
+          class TimeLastUsedUpdater : public QObject
+          {
+          \tQ_OBJECT
+
+          public slots:
+          \tvoid notify();
+          };
+          ''',
+          '''};
+          '''
+          )
+
+          cc_path.write_text(cc)
+          h_path.write_text(h)
+
+          print("=== Remaining fragile symbols ===")
+          for symbol in [
+              "BluetoothHeartbeat",
+              "PowerManager",
+              "TimeEvent",
+              "TimeLastUsedUpdater",
+          ]:
+              print(symbol, symbol in cc)
+
+          assert "BluetoothHeartbeat" not in cc
+          assert "PowerManager" not in cc
+          assert "TimeEvent" not in cc
+          assert "TimeLastUsedUpdater" not in cc
+          assert "btpt-loaded.txt" in cc
+
+      - name: Fix Linux input header
         run: |
           docker run --rm \
             -v "$PWD:/src" \
@@ -35,7 +201,7 @@ jobs:
             ghcr.io/pgaskin/nickeltc:1.0 \
             clean all koboroot
 
-      - name: Verify KoboRoot
+      - name: Verify
         run: |
           ls -lh KoboRoot.tgz
           test -f KoboRoot.tgz
@@ -43,5 +209,5 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kobo-btpt-pr32
+          name: kobo-btpt-445-diagnostic
           path: KoboRoot.tgz
