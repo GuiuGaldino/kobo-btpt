@@ -1,4 +1,4 @@
-name: Build kobo-btpt 4.45 diagnostic
+name: Build kobo-btpt 4.45 fixed
 
 on:
   workflow_dispatch:
@@ -31,9 +31,7 @@ jobs:
               b = text.index(end, a)
               return text[:a] + replacement + text[b:]
 
-          # ------------------------------------------------------------
-          # 1. Replace private Nickel symbol declarations.
-          # ------------------------------------------------------------
+          # Remove fragile private Nickel symbol declarations.
           start = "/* Stop Bluetooth heartbeat after this many seconds of inactivity */"
           end = "static void invokeMainWindowController"
 
@@ -47,9 +45,7 @@ jobs:
           """
           )
 
-          # ------------------------------------------------------------
-          # 2. Replace the beginning of BluetoothPageTurner::run().
-          # ------------------------------------------------------------
+          # Simplify the start of BluetoothPageTurner::run().
           start = "void BluetoothPageTurner::run()\n{"
           end = '\tnh_log("starting");'
 
@@ -65,9 +61,7 @@ jobs:
           """
           )
 
-          # ------------------------------------------------------------
-          # 3. Remove Bluetooth heartbeat loop.
-          # ------------------------------------------------------------
+          # Remove Bluetooth heartbeat block.
           start = "\t\t/* Bluetooth heartbeat to prevent Bluetooth from turning off */"
           end = "\t\t/* Poll devices for input events */"
 
@@ -78,9 +72,7 @@ jobs:
               ""
           )
 
-          # ------------------------------------------------------------
-          # 4. Remove heartbeat + PowerManager handling when button fires.
-          # ------------------------------------------------------------
+          # Remove heartbeat timestamp / PowerManager handling.
           start = "\t\t\t\t\t/* Update Bluetooth heartbeat time */"
           end = "\t\t\t\t\t/* Invoke the configured method */"
 
@@ -91,21 +83,17 @@ jobs:
               ""
           )
 
-          # ------------------------------------------------------------
-          # 5. Fix temporary c_str() pointer.
-          # ------------------------------------------------------------
+          # Fix temporary c_str pointer.
           old = """\t\t\t\t\tconst char *method = pair.second
-                          \t\t\t\t\t\t.toStdString().c_str();
-                          \t\t\t\t\tinvokeMainWindowController(method);"""
+          \t\t\t\t\t\t.toStdString().c_str();
+          \t\t\t\t\tinvokeMainWindowController(method);"""
 
           new = """\t\t\t\t\tQByteArray method = pair.second.toUtf8();
-                          \t\t\t\t\tinvokeMainWindowController(method.constData());"""
+          \t\t\t\t\tinvokeMainWindowController(method.constData());"""
 
           cc = cc.replace(old, new)
 
-          # ------------------------------------------------------------
-          # 6. Remove TimeLastUsedUpdater implementation completely.
-          # ------------------------------------------------------------
+          # Remove TimeLastUsedUpdater implementation.
           start = "void TimeLastUsedUpdater::notify()"
           end = "static int btpt_init()"
 
@@ -116,9 +104,7 @@ jobs:
               ""
           )
 
-          # ------------------------------------------------------------
-          # 7. Replace btpt_init with minimal diagnostic init.
-          # ------------------------------------------------------------
+          # Replace btpt_init with minimal diagnostic init.
           start = "static int btpt_init()"
           end = "static struct nh_info btpt_info"
 
@@ -153,9 +139,7 @@ jobs:
           """
           )
 
-          # ------------------------------------------------------------
-          # 8. Replace dlsym table with ONLY MainWindowController.
-          # ------------------------------------------------------------
+          # Keep only MainWindowController symbols.
           start = "static struct nh_dlsym btpt_dlsym[] = {"
           end = "NickelHook("
 
@@ -178,9 +162,7 @@ jobs:
           """
           )
 
-          # ------------------------------------------------------------
-          # 9. Replace header classes with simplified BluetoothPageTurner.
-          # ------------------------------------------------------------
+          # Simplify header.
           start = "class BluetoothPageTurner : public QThread"
           end = "#endif /* BTPT_H */"
 
@@ -215,12 +197,19 @@ jobs:
           """
           )
 
+          # Fix startup bug: scan devices which are already connected.
+          old = 'watcher.addPath("/dev/input");'
+          new = '''watcher.addPath("/dev/input");
+
+              /* Scan devices which were already connected at startup */
+              scanDevices();'''
+
+          assert old in cc, "Could not find watcher.addPath"
+          cc = cc.replace(old, new, 1)
+
           cc_path.write_text(cc)
           h_path.write_text(h)
 
-          # ------------------------------------------------------------
-          # Diagnostics.
-          # ------------------------------------------------------------
           print("=== Checking patch ===")
 
           forbidden_cc = [
@@ -244,12 +233,18 @@ jobs:
               "OK" if "btpt-loaded.txt" in cc else "MISSING"
           )
 
+          print(
+              "initial scan:",
+              "OK" if "already connected at startup" in cc else "MISSING"
+          )
+
           for item in forbidden_cc:
               assert item not in cc, f"Still present: {item}"
 
           assert "TimeLastUsedUpdater" not in h
           assert "void notify();" not in h
           assert "btpt-loaded.txt" in cc
+          assert "already connected at startup" in cc
 
           print("Patch OK")
 
@@ -281,5 +276,5 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kobo-btpt-445-diagnostic
+          name: kobo-btpt-445-fixed
           path: KoboRoot.tgz
