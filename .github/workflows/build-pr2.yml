@@ -1,4 +1,4 @@
-name: Build kobo-btpt single-double debug v4
+name: Build kobo-btpt single-double debug v5
 
 on:
   workflow_dispatch:
@@ -8,74 +8,122 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout PR32
+      - name: Checkout kobo-btpt
         uses: actions/checkout@v4
         with:
           repository: pgaskin/kobo-btpt
           ref: update-nh
           submodules: recursive
 
-      - name: Patch Kobo 4.45 single-double permanent debug
-        shell: python
+      - name: Install Kobo 4.45 single-double source
+        shell: bash
         run: |
-          from pathlib import Path
+          cat > src/btpt.h <<'EOF'
+          #ifndef BTPT_H
+          #define BTPT_H
 
-          cc_path = Path("src/btpt.cc")
-          h_path = Path("src/btpt.h")
+          #include <linux/input.h>
+          #include <linux/uinput.h>
 
-          cc = cc_path.read_text()
-          h = h_path.read_text()
+          #include <QFileSystemWatcher>
+          #include <QList>
+          #include <QMap>
+          #include <QMutex>
+          #include <QPair>
+          #include <QThread>
+          #include <QWaitCondition>
 
-          def replace_between(text, start, end, replacement):
-              assert start in text, f"START marker not found: {start}"
-              a = text.index(start)
+          class Device
+          {
+          public:
+              int fd;
+              QList<QPair<struct input_event, QString>> cfg;
+          };
 
-              assert end in text[a:], f"END marker not found: {end}"
-              b = text.index(end, a)
+          class BluetoothPageTurner : public QThread
+          {
+              Q_OBJECT
 
-              return text[:a] + replacement + text[b:]
+              void run() override;
 
-          print("Source loaded:")
-          print("  btpt.cc bytes:", len(cc))
-          print("  btpt.h bytes:", len(h))
+          private:
+              bool addDevice(
+                  const QString &name,
+                  const QString &uniq,
+                  const QString &handler
+              );
 
-          # ============================================================
-          # 1. DEBUG INCLUDE
-          # ============================================================
+              bool scanDevices();
 
-          assert "#include <stdio.h>" in cc
+              QFileSystemWatcher watcher;
+              QMap<QString, Device> devices;
 
-          cc = cc.replace(
-              "#include <stdio.h>",
-              "#include <stdio.h>\n#include <stdarg.h>",
-              1
-          )
+              QMutex mutex;
+              QWaitCondition newDevice;
 
-          # ============================================================
-          # 2. KOBO 4.45 COMPATIBILITY + DEBUG FUNCTIONS
-          #
-          # Remove:
-          #   BluetoothHeartbeat
-          #   PowerManager
-          #   TimeEvent
-          #
-          # Keep only MainWindowController symbols.
-          # ============================================================
+              int deviceChanges = 0;
 
-          cc = replace_between(
-              cc,
-              "/* Stop Bluetooth heartbeat after this many seconds of inactivity */",
-              "static void invokeMainWindowController",
-              r'''static void *(*MainWindowController_sharedInstance)();
+          public slots:
+              void directoryChanged(const QString &path);
+          };
+
+          #endif /* BTPT_H */
+          EOF
+
+          cat > src/btpt.cc <<'EOF'
+          #include <string.h>
+          #include <stdio.h>
+          #include <stdarg.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <time.h>
+          #include <stdlib.h>
+          #include <errno.h>
+          #include <cstddef>
+          #include <cstdlib>
+          #include <sys/stat.h>
+
+          #include <linux/uinput.h>
+
+          #include <NickelHook.h>
+
+          #include <QApplication>
+          #include <QDir>
+          #include <QFileSystemWatcher>
+          #include <QFile>
+          #include <QWidget>
+          #include <QTextStream>
+          #include <QThread>
+          #include <QByteArray>
+
+          #include "btpt.h"
+          #include "eventcodes.h"
+
+          #define BTPT_DIR "/mnt/onboard/.btpt/"
+
+          static void *(*MainWindowController_sharedInstance)();
           static QWidget *(*MainWindowController_currentView)(void *);
 
           static void debugLog(const char *fmt, ...)
           {
-              FILE *f = fopen("/mnt/onboard/btpt-debug.txt", "a");
+              FILE *f = fopen(
+                  "/mnt/onboard/btpt-debug.txt",
+                  "a"
+              );
 
               if (!f) {
                   return;
               }
+
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+
+              fprintf(
+                  f,
+                  "[%lld.%03lld] ",
+                  (long long)ts.tv_sec,
+                  (long long)(ts.tv_nsec / 1000000LL)
+              );
 
               va_list args;
               va_start(args, fmt);
@@ -98,656 +146,1137 @@ jobs:
                   ((long long)ts.tv_nsec / 1000000LL);
           }
 
-          '''
+          static void invokeMainWindowController(
+              const char *method
           )
-
-          # ============================================================
-          # 3. REPLACE ENTIRE PAGE INVOCATION FUNCTION
-          #
-          # Permanent debug:
-          #   requested method
-          #   current view
-          #   invokeMethod result
-          # ============================================================
-
-          cc = replace_between(
-              cc,
-              "static void invokeMainWindowController(const char *method)",
-              "bool BluetoothPageTurner::addDevice(",
-              r'''static void invokeMainWindowController(const char *method)
           {
-              void *mwc = MainWindowController_sharedInstance();
+              debugLog(
+                  "INVOKE begin method='%s'",
+                  method
+              );
+
+              void *mwc =
+                  MainWindowController_sharedInstance();
 
               if (!mwc) {
                   debugLog(
-                      "INVOKE FAILED method='%s' reason=no-MainWindowController",
+                      "INVOKE FAIL method='%s' reason=no-controller",
                       method
                   );
                   return;
               }
 
-              QWidget *cv = MainWindowController_currentView(mwc);
+              QWidget *cv =
+                  MainWindowController_currentView(mwc);
 
               if (!cv) {
                   debugLog(
-                      "INVOKE FAILED method='%s' reason=no-current-view",
+                      "INVOKE FAIL method='%s' reason=no-view",
                       method
                   );
                   return;
               }
 
-              QString viewName = cv->objectName();
+              QString viewName =
+                  cv->objectName();
 
               debugLog(
-                  "INVOKE request method='%s' view='%s'",
+                  "INVOKE method='%s' view='%s'",
                   method,
                   viewName.toUtf8().constData()
               );
 
               if (viewName != "ReadingView") {
                   debugLog(
-                      "INVOKE SKIPPED method='%s' reason=not-reading-view",
+                      "INVOKE SKIP method='%s' reason=not-reading-view",
                       method
                   );
                   return;
               }
 
-              bool result = QMetaObject::invokeMethod(
-                  cv,
-                  method,
-                  Qt::QueuedConnection
-              );
+              bool result =
+                  QMetaObject::invokeMethod(
+                      cv,
+                      method,
+                      Qt::QueuedConnection
+                  );
 
               debugLog(
-                  "INVOKE result method='%s' success=%d",
+                  "INVOKE done method='%s' success=%d",
                   method,
                   result ? 1 : 0
               );
           }
 
-          '''
+          bool BluetoothPageTurner::addDevice(
+              const QString &name,
+              const QString &uniq,
+              const QString &handler
           )
-
-          # ============================================================
-          # 4. ADD DEVICE DEBUG
-          # ============================================================
-
-          marker = """bool BluetoothPageTurner::addDevice(
-          \tconst QString &name, const QString &uniq, const QString &handler)
           {
-          \tint fd;"""
-
-          replacement = """bool BluetoothPageTurner::addDevice(
-          \tconst QString &name, const QString &uniq, const QString &handler)
-          {
-          \tdebugLog(
-          \t\t"addDevice name='%s' uniq='%s' handler='%s'",
-          \t\tname.toUtf8().constData(),
-          \t\tuniq.toUtf8().constData(),
-          \t\thandler.toUtf8().constData()
-          \t);
-
-          \tint fd;"""
-
-          assert marker in cc, "addDevice marker not found"
-          cc = cc.replace(marker, replacement, 1)
-
-          # ============================================================
-          # 5. CONFIG FILE DEBUG
-          # ============================================================
-
-          marker = """\tif (!cfg.open(QIODevice::ReadOnly | QIODevice::Text)) {"""
-
-          replacement = """\tdebugLog(
-          \t\t"trying config '%s'",
-          \t\tcfg.fileName().toUtf8().constData()
-          \t);
-
-          \tif (!cfg.open(QIODevice::ReadOnly | QIODevice::Text)) {
-          \t\tdebugLog(
-          \t\t\t"CONFIG OPEN FAILED '%s'",
-          \t\t\tcfg.fileName().toUtf8().constData()
-          \t\t);"""
-
-          assert marker in cc, "config open marker not found"
-          cc = cc.replace(marker, replacement, 1)
-
-          # ============================================================
-          # 6. DEVICE ACQUIRED DEBUG
-          # ============================================================
-
-          marker = """\tnh_log("acquired device %s: %s","""
-
-          replacement = """\tdebugLog(
-          \t\t"DEVICE ACQUIRED handler='%s' uniq='%s' config='%s'",
-          \t\thandler.toUtf8().constData(),
-          \t\tuniq.toUtf8().constData(),
-          \t\tcfg.fileName().toUtf8().constData()
-          \t);
-
-          \tnh_log("acquired device %s: %s","""
-
-          assert marker in cc, "device acquired marker not found"
-          cc = cc.replace(marker, replacement, 1)
-
-          # ============================================================
-          # 7. SCAN DEBUG
-          # ============================================================
-
-          marker = '\tnh_log("checking /proc/bus/input/devices for new devices");'
-
-          replacement = """\tnh_log("checking /proc/bus/input/devices for new devices");
-          \tdebugLog("SCAN /proc/bus/input/devices");"""
-
-          assert marker in cc, "scan marker not found"
-          cc = cc.replace(marker, replacement, 1)
-
-          # ============================================================
-          # 8. LOG EVERY INPUT DEVICE ENTRY
-          # ============================================================
-
-          marker = """\t\telse if (type == "H") {
-          \t\t\t/* Skip if not Bluetooth device */"""
-
-          replacement = """\t\telse if (type == "H") {
-          \t\t\tdebugLog(
-          \t\t\t\t"INPUT i='%s' name='%s' uniq='%s' handlers='%s'",
-          \t\t\t\ti.toUtf8().constData(),
-          \t\t\t\tn.toUtf8().constData(),
-          \t\t\t\tu.toUtf8().constData(),
-          \t\t\t\tline.toUtf8().constData()
-          \t\t\t);
-
-          \t\t\t/* Skip if not Bluetooth device */"""
-
-          assert marker in cc, "input handler marker not found"
-          cc = cc.replace(marker, replacement, 1)
-
-          # ============================================================
-          # 9. REPLACE RUN() LOCAL STATE
-          #
-          # DOUBLE_CLICK_MS = 300
-          # ============================================================
-
-          cc = replace_between(
-              cc,
-              "void BluetoothPageTurner::run()\n{",
-              '\tnh_log("starting");',
-              """void BluetoothPageTurner::run()
-          {
-          \tfd_set rfds;
-          \tstruct timeval tv;
-
-          \tbool pendingSingleClick = false;
-          \tlong long firstClickTime = 0;
-          \tlong long singleClickDeadline = 0;
-
-          \tconst long long DOUBLE_CLICK_MS = 300;
-
-          """
-          )
-
-          # ============================================================
-          # 10. INITIAL SCAN FIX
-          #
-          # This is the fix already proven necessary on your Kobo.
-          # ============================================================
-
-          marker = 'watcher.addPath("/dev/input");'
-
-          replacement = '''watcher.addPath("/dev/input");
-
-          \tdebugLog("watching /dev/input");
-          \tdebugLog("performing initial device scan");
-
-          \tscanDevices();'''
-
-          assert marker in cc, "watcher marker not found"
-          cc = cc.replace(marker, replacement, 1)
-
-          # ============================================================
-          # 11. REMOVE OLD BLUETOOTH HEARTBEAT
-          # ============================================================
-
-          cc = replace_between(
-              cc,
-              "\t\t/* Bluetooth heartbeat to prevent Bluetooth from turning off */",
-              "\t\t/* Poll devices for input events */",
-              ""
-          )
-
-          # ============================================================
-          # 12. SELECT TIMEOUT + SINGLE-CLICK TIMEOUT
-          #
-          # After first click, select() waits only until the
-          # 300 ms deadline.
-          #
-          # If deadline expires:
-          #     nextPage
-          # ============================================================
-
-          marker = """\t\ttv.tv_sec = 1;
-          \t\ttv.tv_usec = 0;"""
-
-          replacement = """\t\tlong long nowMs = monotonicMilliseconds();
-
-          \t\tif (
-          \t\t\tpendingSingleClick &&
-          \t\t\tnowMs >= singleClickDeadline
-          \t\t) {
-          \t\t\tlong long elapsed =
-          \t\t\t\tnowMs - firstClickTime;
-
-          \t\t\tdebugLog(
-          \t\t\t\t"SINGLEDOUBLE timeout elapsed=%lldms -> nextPage",
-          \t\t\t\telapsed
-          \t\t\t);
-
-          \t\t\tpendingSingleClick = false;
-          \t\t\tfirstClickTime = 0;
-          \t\t\tsingleClickDeadline = 0;
-
-          \t\t\tinvokeMainWindowController("nextPage");
-          \t\t}
-
-          \t\tif (pendingSingleClick) {
-          \t\t\tlong long remaining =
-          \t\t\t\tsingleClickDeadline -
-          \t\t\t\tmonotonicMilliseconds();
-
-          \t\t\tif (remaining < 0) {
-          \t\t\t\tremaining = 0;
-          \t\t\t}
-
-          \t\t\ttv.tv_sec =
-          \t\t\t\tremaining / 1000;
-
-          \t\t\ttv.tv_usec =
-          \t\t\t\t(remaining % 1000) * 1000;
-          \t\t}
-          \t\telse {
-          \t\t\ttv.tv_sec = 1;
-          \t\t\ttv.tv_usec = 0;
-          \t\t}"""
-
-          assert marker in cc, "select timeout marker not found"
-          cc = cc.replace(marker, replacement, 1)
-
-          # ============================================================
-          # 13. RAW EVENT DEBUG
-          # ============================================================
-
-          marker = """\t\t\tif (e.type == 0x00 &&
-          \t\t\t    e.code == 0x00 &&
-          \t\t\t    e.value == 0x0001) {"""
-
-          replacement = """\t\t\tdebugLog(
-          \t\t\t\t"EVENT type=%u code=%u value=%d",
-          \t\t\t\t(unsigned)e.type,
-          \t\t\t\t(unsigned)e.code,
-          \t\t\t\t(int)e.value
-          \t\t\t);
-
-          \t\t\tif (e.type == 0x00 &&
-          \t\t\t    e.code == 0x00 &&
-          \t\t\t    e.value == 0x0001) {"""
-
-          assert marker in cc, "raw event marker not found"
-          cc = cc.replace(marker, replacement, 1)
-
-          # ============================================================
-          # 14. REPLACE EVENT MATCH BODY
-          #
-          # Config:
-          #
-          # singleDouble EV_KEY KEY_VOLUMEUP 1
-          #
-          # First click:
-          #     wait up to 300 ms
-          #
-          # Second click:
-          #     prevPage
-          #
-          # Timeout:
-          #     nextPage
-          #
-          # Normal kobo-btpt methods still work too.
-          # ============================================================
-
-          match_start = """\t\t\t\tif (e.type == test.type &&
-          \t\t\t\t    e.code == test.code &&
-          \t\t\t\t    e.value == test.value) {"""
-
-          match_end = """\t\t\t\t}
-          \t\t\t}"""
-
-          assert match_start in cc, "event match start not found"
-
-          a = cc.index(match_start)
-          b = cc.index(match_end, a)
-
-          replacement = """\t\t\t\tif (e.type == test.type &&
-          \t\t\t\t    e.code == test.code &&
-          \t\t\t\t    e.value == test.value) {
-
-          \t\t\t\t\tQByteArray method =
-          \t\t\t\t\t\tpair.second.toUtf8();
-
-          \t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t"MATCH method='%s' type=%u code=%u value=%d",
-          \t\t\t\t\t\tmethod.constData(),
-          \t\t\t\t\t\t(unsigned)e.type,
-          \t\t\t\t\t\t(unsigned)e.code,
-          \t\t\t\t\t\t(int)e.value
-          \t\t\t\t\t);
-
-          \t\t\t\t\tif (method == "singleDouble") {
-
-          \t\t\t\t\t\tlong long clickTime =
-          \t\t\t\t\t\t\tmonotonicMilliseconds();
-
-          \t\t\t\t\t\t/*
-          \t\t\t\t\t\t * If an old first click has already
-          \t\t\t\t\t\t * expired, commit it as nextPage
-          \t\t\t\t\t\t * before treating this as a new click.
-          \t\t\t\t\t\t */
-          \t\t\t\t\t\tif (
-          \t\t\t\t\t\t\tpendingSingleClick &&
-          \t\t\t\t\t\t\tclickTime > singleClickDeadline
-          \t\t\t\t\t\t) {
-          \t\t\t\t\t\t\tlong long elapsed =
-          \t\t\t\t\t\t\t\tclickTime - firstClickTime;
-
-          \t\t\t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t\t\t"SINGLEDOUBLE expired first click elapsed=%lldms -> nextPage",
-          \t\t\t\t\t\t\t\telapsed
-          \t\t\t\t\t\t\t);
-
-          \t\t\t\t\t\t\tpendingSingleClick = false;
-          \t\t\t\t\t\t\tfirstClickTime = 0;
-          \t\t\t\t\t\t\tsingleClickDeadline = 0;
-
-          \t\t\t\t\t\t\tinvokeMainWindowController(
-          \t\t\t\t\t\t\t\t"nextPage"
-          \t\t\t\t\t\t\t);
-          \t\t\t\t\t\t}
-
-          \t\t\t\t\t\t/*
-          \t\t\t\t\t\t * Second click inside the window.
-          \t\t\t\t\t\t */
-          \t\t\t\t\t\tif (pendingSingleClick) {
-          \t\t\t\t\t\t\tlong long elapsed =
-          \t\t\t\t\t\t\t\tclickTime - firstClickTime;
-
-          \t\t\t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t\t\t"SINGLEDOUBLE second click elapsed=%lldms -> prevPage",
-          \t\t\t\t\t\t\t\telapsed
-          \t\t\t\t\t\t\t);
-
-          \t\t\t\t\t\t\tpendingSingleClick = false;
-          \t\t\t\t\t\t\tfirstClickTime = 0;
-          \t\t\t\t\t\t\tsingleClickDeadline = 0;
-
-          \t\t\t\t\t\t\tinvokeMainWindowController(
-          \t\t\t\t\t\t\t\t"prevPage"
-          \t\t\t\t\t\t\t);
-          \t\t\t\t\t\t}
-          \t\t\t\t\t\telse {
-          \t\t\t\t\t\t\t/*
-          \t\t\t\t\t\t\t * First click.
-          \t\t\t\t\t\t\t */
-          \t\t\t\t\t\t\tpendingSingleClick = true;
-
-          \t\t\t\t\t\t\tfirstClickTime =
-          \t\t\t\t\t\t\t\tclickTime;
-
-          \t\t\t\t\t\t\tsingleClickDeadline =
-          \t\t\t\t\t\t\t\tclickTime +
-          \t\t\t\t\t\t\t\tDOUBLE_CLICK_MS;
-
-          \t\t\t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t\t\t"SINGLEDOUBLE first click window=%lldms",
-          \t\t\t\t\t\t\t\tDOUBLE_CLICK_MS
-          \t\t\t\t\t\t\t);
-          \t\t\t\t\t\t}
-          \t\t\t\t\t}
-          \t\t\t\t\telse {
-          \t\t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t\t"NORMAL method='%s'",
-          \t\t\t\t\t\t\tmethod.constData()
-          \t\t\t\t\t\t);
-
-          \t\t\t\t\t\tinvokeMainWindowController(
-          \t\t\t\t\t\t\tmethod.constData()
-          \t\t\t\t\t\t);
-          \t\t\t\t\t}
-          """
-
-          cc = (
-              cc[:a] +
-              replacement +
-              cc[b:]
-          )
-
-          # ============================================================
-          # 15. REMOVE TimeLastUsedUpdater
-          # ============================================================
-
-          cc = replace_between(
-              cc,
-              "void TimeLastUsedUpdater::notify()",
-              "static int btpt_init()",
-              ""
-          )
-
-          # ============================================================
-          # 16. INIT + PERMANENT DEBUG
-          # ============================================================
-
-          cc = replace_between(
-              cc,
-              "static int btpt_init()",
-              "static struct nh_info btpt_info",
-              """static int btpt_init()
-          {
-          \tmkdir(BTPT_DIR, 0755);
-
-          \tFILE *debug =
-          \t\tfopen("/mnt/onboard/btpt-debug.txt", "w");
-
-          \tif (debug) {
-          \t\tfputs(
-          \t\t\t"=== kobo-btpt single-double debug v4 ===\\n",
-          \t\t\tdebug
-          \t\t);
-          \t\tfclose(debug);
-          \t}
-
-          \tdebugLog("btpt_init reached");
-          \tdebugLog("BUILD single-double-debug-v4");
-          \tdebugLog("DOUBLE_CLICK_MS=300");
-
-          \tFILE *marker =
-          \t\tfopen("/mnt/onboard/btpt-loaded.txt", "w");
-
-          \tif (marker) {
-          \t\tfputs(
-          \t\t\t"kobo-btpt single-double-debug-v4\\n",
-          \t\t\tmarker
-          \t\t);
-          \t\tfclose(marker);
-          \t}
-
-          \tBluetoothPageTurner *btpt =
-          \t\tnew BluetoothPageTurner();
-
-          \tQObject::connect(
-          \t\tbtpt,
-          \t\t&QThread::finished,
-          \t\tbtpt,
-          \t\t&QObject::deleteLater
-          \t);
-
-          \tbtpt->start();
-
-          \tdebugLog(
-          \t\t"BluetoothPageTurner thread started"
-          \t);
-
-          \treturn 0;
-          }
-
-          """
-          )
-
-          # ============================================================
-          # 17. ONLY TWO REQUIRED NICKEL SYMBOLS
-          # ============================================================
-
-          cc = replace_between(
-              cc,
-              "static struct nh_dlsym btpt_dlsym[] = {",
-              "NickelHook(",
-              """static struct nh_dlsym btpt_dlsym[] = {
-          \t{
-          \t\t.name =
-          \t\t\t"_ZN20MainWindowController14sharedInstanceEv",
-          \t\t.out =
-          \t\t\tnh_symoutptr(
-          \t\t\t\tMainWindowController_sharedInstance
-          \t\t\t)
-          \t},
-          \t{
-          \t\t.name =
-          \t\t\t"_ZNK20MainWindowController11currentViewEv",
-          \t\t.out =
-          \t\t\tnh_symoutptr(
-          \t\t\t\tMainWindowController_currentView
-          \t\t\t)
-          \t},
-          \t{0},
-          };
-
-          """
-          )
-
-          # ============================================================
-          # 18. HEADER — REMOVE TimeLastUsedUpdater / notify
-          # ============================================================
-
-          h = replace_between(
-              h,
-              "class BluetoothPageTurner : public QThread",
-              "#endif /* BTPT_H */",
-              """class BluetoothPageTurner : public QThread
-          {
-              Q_OBJECT
-
-              void run() override;
-
-          private:
-              bool addDevice(
-                  const QString &name,
-                  const QString &uniq,
-                  const QString &handler
+              debugLog(
+                  "ADD begin name='%s' uniq='%s' handler='%s'",
+                  name.toUtf8().constData(),
+                  uniq.toUtf8().constData(),
+                  handler.toUtf8().constData()
               );
 
-              bool scanDevices();
-              void learn(Device &device);
+              if (devices.contains(uniq)) {
+                  debugLog(
+                      "ADD skip uniq='%s' reason=already-added",
+                      uniq.toUtf8().constData()
+                  );
 
-              QFileSystemWatcher watcher;
-              QMap<QString, Device> devices;
-              QMutex mutex;
-              QWaitCondition newDevice;
-              int deviceChanges = 0;
+                  return false;
+              }
 
-          public slots:
-              void directoryChanged(const QString &path);
+              /*
+               * First try the Bluetooth name.
+               */
+              QFile cfg(BTPT_DIR + name);
+
+              debugLog(
+                  "ADD default-config='%s'",
+                  cfg.fileName().toUtf8().constData()
+              );
+
+              /*
+               * Bluetooth address config overrides name.
+               */
+              QStringList list =
+                  QDir(BTPT_DIR).entryList();
+
+              debugLog(
+                  "ADD config-directory entries=%d",
+                  list.size()
+              );
+
+              for (int i = 0; i < list.size(); ++i) {
+                  QString filename =
+                      list.at(i);
+
+                  debugLog(
+                      "ADD config-candidate='%s'",
+                      filename.toUtf8().constData()
+                  );
+
+                  if (
+                      filename.toLower() ==
+                      uniq.toLower()
+                  ) {
+                      cfg.setFileName(
+                          BTPT_DIR + filename
+                      );
+
+                      debugLog(
+                          "ADD address-config-match='%s'",
+                          cfg.fileName()
+                              .toUtf8()
+                              .constData()
+                      );
+                  }
+              }
+
+              debugLog(
+                  "ADD opening-config='%s'",
+                  cfg.fileName().toUtf8().constData()
+              );
+
+              if (
+                  !cfg.open(
+                      QIODevice::ReadOnly |
+                      QIODevice::Text
+                  )
+              ) {
+                  debugLog(
+                      "ADD FAIL config-open path='%s' error='%s'",
+                      cfg.fileName()
+                          .toUtf8()
+                          .constData(),
+                      cfg.errorString()
+                          .toUtf8()
+                          .constData()
+                  );
+
+                  return false;
+              }
+
+              debugLog(
+                  "ADD config-open OK path='%s'",
+                  cfg.fileName().toUtf8().constData()
+              );
+
+              /*
+               * Read config BEFORE touching event device.
+               */
+              QByteArray text =
+                  cfg.readAll();
+
+              cfg.close();
+
+              debugLog(
+                  "ADD config-read bytes=%d",
+                  text.size()
+              );
+
+              /*
+               * Print config contents safely.
+               */
+              QByteArray printable = text;
+              printable.replace('\r', ' ');
+              printable.replace('\n', '|');
+
+              debugLog(
+                  "ADD config-raw='%s'",
+                  printable.constData()
+              );
+
+              /*
+               * Parse config.
+               */
+              QList<QPair<struct input_event, QString>>
+                  parsedConfig;
+
+              QTextStream in(&text);
+
+              int lineNumber = 0;
+
+              while (!in.atEnd()) {
+                  QString line =
+                      in.readLine();
+
+                  lineNumber++;
+
+                  debugLog(
+                      "CONFIG line=%d text='%s'",
+                      lineNumber,
+                      line.toUtf8().constData()
+                  );
+
+                  QList<QString> parts =
+                      line.split(
+                          " ",
+                          QString::SkipEmptyParts
+                      );
+
+                  debugLog(
+                      "CONFIG line=%d parts=%d",
+                      lineNumber,
+                      parts.size()
+                  );
+
+                  if (parts.size() != 4) {
+                      debugLog(
+                          "CONFIG FAIL line=%d reason=parts expected=4 actual=%d",
+                          lineNumber,
+                          parts.size()
+                      );
+
+                      return false;
+                  }
+
+                  debugLog(
+                      "CONFIG line=%d method='%s' type='%s' code='%s' value='%s'",
+                      lineNumber,
+                      parts[0].toUtf8().constData(),
+                      parts[1].toUtf8().constData(),
+                      parts[2].toUtf8().constData(),
+                      parts[3].toUtf8().constData()
+                  );
+
+                  struct input_event event = { 0 };
+
+                  bool ok = false;
+
+                  event.type =
+                      parseEventCode(
+                          &ok,
+                          parts[1]
+                      );
+
+                  if (!ok) {
+                      debugLog(
+                          "CONFIG FAIL line=%d invalid-type='%s'",
+                          lineNumber,
+                          parts[1]
+                              .toUtf8()
+                              .constData()
+                      );
+
+                      return false;
+                  }
+
+                  debugLog(
+                      "CONFIG line=%d parsed-type=%u",
+                      lineNumber,
+                      (unsigned)event.type
+                  );
+
+                  event.code =
+                      parseEventCode(
+                          &ok,
+                          parts[2]
+                      );
+
+                  if (!ok) {
+                      debugLog(
+                          "CONFIG FAIL line=%d invalid-code='%s'",
+                          lineNumber,
+                          parts[2]
+                              .toUtf8()
+                              .constData()
+                      );
+
+                      return false;
+                  }
+
+                  debugLog(
+                      "CONFIG line=%d parsed-code=%u",
+                      lineNumber,
+                      (unsigned)event.code
+                  );
+
+                  event.value =
+                      parseEventCode(
+                          &ok,
+                          parts[3]
+                      );
+
+                  if (!ok) {
+                      debugLog(
+                          "CONFIG FAIL line=%d invalid-value='%s'",
+                          lineNumber,
+                          parts[3]
+                              .toUtf8()
+                              .constData()
+                      );
+
+                      return false;
+                  }
+
+                  debugLog(
+                      "CONFIG line=%d parsed-value=%d",
+                      lineNumber,
+                      (int)event.value
+                  );
+
+                  QPair<
+                      struct input_event,
+                      QString
+                  > map(
+                      event,
+                      parts[0]
+                  );
+
+                  parsedConfig.append(map);
+
+                  debugLog(
+                      "CONFIG line=%d OK method='%s'",
+                      lineNumber,
+                      parts[0]
+                          .toUtf8()
+                          .constData()
+                  );
+              }
+
+              if (parsedConfig.empty()) {
+                  debugLog(
+                      "ADD FAIL reason=config-empty"
+                  );
+
+                  return false;
+              }
+
+              /*
+               * Now open event device.
+               */
+              QString path =
+                  "/dev/input/" + handler;
+
+              debugLog(
+                  "ADD opening-input='%s'",
+                  path.toUtf8().constData()
+              );
+
+              errno = 0;
+
+              int fd = open(
+                  path.toStdString().c_str(),
+                  O_RDONLY | O_NONBLOCK
+              );
+
+              if (fd < 0) {
+                  debugLog(
+                      "ADD FAIL input-open path='%s' errno=%d error='%s'",
+                      path.toUtf8().constData(),
+                      errno,
+                      strerror(errno)
+                  );
+
+                  return false;
+              }
+
+              debugLog(
+                  "ADD input-open OK fd=%d path='%s'",
+                  fd,
+                  path.toUtf8().constData()
+              );
+
+              Device &device =
+                  devices[uniq];
+
+              device.fd = fd;
+              device.cfg = parsedConfig;
+
+              debugLog(
+                  "DEVICE ACQUIRED handler='%s' uniq='%s' config='%s' mappings=%d fd=%d",
+                  handler.toUtf8().constData(),
+                  uniq.toUtf8().constData(),
+                  cfg.fileName()
+                      .toUtf8()
+                      .constData(),
+                  device.cfg.size(),
+                  fd
+              );
+
+              return true;
+          }
+
+          void BluetoothPageTurner::directoryChanged(
+              const QString &path
+          )
+          {
+              debugLog(
+                  "DIRECTORY CHANGED path='%s'",
+                  path.toUtf8().constData()
+              );
+
+              mutex.lock();
+
+              deviceChanges++;
+
+              debugLog(
+                  "DIRECTORY CHANGED deviceChanges=%d",
+                  deviceChanges
+              );
+
+              newDevice.wakeAll();
+
+              mutex.unlock();
+          }
+
+          bool BluetoothPageTurner::scanDevices()
+          {
+              bool devicesAdded = false;
+
+              debugLog(
+                  "SCAN begin"
+              );
+
+              QFile file(
+                  "/proc/bus/input/devices"
+              );
+
+              if (
+                  !file.open(
+                      QIODevice::ReadOnly |
+                      QIODevice::Text
+                  )
+              ) {
+                  debugLog(
+                      "SCAN FAIL open /proc/bus/input/devices error='%s'",
+                      file.errorString()
+                          .toUtf8()
+                          .constData()
+                  );
+
+                  return false;
+              }
+
+              QByteArray text =
+                  file.readAll();
+
+              file.close();
+
+              QTextStream in(&text);
+
+              QString i;
+              QString u;
+              QString n;
+
+              while (!in.atEnd()) {
+                  QString line =
+                      in.readLine();
+
+                  QString type =
+                      line.section(
+                          ": ",
+                          0,
+                          0
+                      );
+
+                  if (type == "I") {
+                      i =
+                          line.section(
+                              ": ",
+                              1
+                          );
+                  }
+                  else if (type == "U") {
+                      u =
+                          line.section(
+                              ": Uniq=",
+                              1
+                          );
+
+                      u.remove(':');
+                  }
+                  else if (type == "N") {
+                      n =
+                          line.section(
+                              ": Name=",
+                              1
+                          );
+
+                      n.chop(1);
+                      n.remove(0, 1);
+                  }
+                  else if (type == "H") {
+                      debugLog(
+                          "INPUT i='%s' name='%s' uniq='%s' handlers='%s'",
+                          i.toUtf8().constData(),
+                          n.toUtf8().constData(),
+                          u.toUtf8().constData(),
+                          line.toUtf8().constData()
+                      );
+
+                      if (
+                          !i.startsWith(
+                              "Bus=0005 "
+                          )
+                      ) {
+                          continue;
+                      }
+
+                      QList<QString> handlers =
+                          line
+                              .section(
+                                  "Handlers=",
+                                  1
+                              )
+                              .split(" ");
+
+                      foreach(
+                          const QString &handler,
+                          handlers
+                      ) {
+                          if (
+                              handler.startsWith(
+                                  "event"
+                              )
+                          ) {
+                              debugLog(
+                                  "SCAN Bluetooth event handler='%s'",
+                                  handler
+                                      .toUtf8()
+                                      .constData()
+                              );
+
+                              bool added =
+                                  addDevice(
+                                      n,
+                                      u,
+                                      handler
+                                  );
+
+                              debugLog(
+                                  "SCAN addDevice result=%d uniq='%s'",
+                                  added ? 1 : 0,
+                                  u.toUtf8().constData()
+                              );
+
+                              devicesAdded |= added;
+                          }
+                      }
+                  }
+              }
+
+              debugLog(
+                  "SCAN end added=%d device-count=%d",
+                  devicesAdded ? 1 : 0,
+                  devices.size()
+              );
+
+              return devicesAdded;
+          }
+
+          void BluetoothPageTurner::run()
+          {
+              fd_set rfds;
+              struct timeval tv;
+
+              bool pendingSingleClick = false;
+
+              long long firstClickTime = 0;
+              long long singleClickDeadline = 0;
+
+              const long long DOUBLE_CLICK_MS =
+                  300;
+
+              debugLog(
+                  "THREAD run begin"
+              );
+
+              QObject::connect(
+                  &watcher,
+                  &QFileSystemWatcher::directoryChanged,
+                  this,
+                  &BluetoothPageTurner::directoryChanged
+              );
+
+              bool watching =
+                  watcher.addPath(
+                      "/dev/input"
+                  );
+
+              debugLog(
+                  "WATCH /dev/input result=%d",
+                  watching ? 1 : 0
+              );
+
+              /*
+               * Critical Kobo fix:
+               * scan immediately.
+               */
+              debugLog(
+                  "INITIAL SCAN begin"
+              );
+
+              scanDevices();
+
+              debugLog(
+                  "INITIAL SCAN finished device-count=%d",
+                  devices.size()
+              );
+
+              while (1) {
+                  struct input_event e;
+                  int ret;
+
+                  /*
+                   * Process device changes.
+                   */
+                  mutex.lock();
+
+                  if (
+                      deviceChanges > 0
+                  ) {
+                      int changes =
+                          deviceChanges;
+
+                      deviceChanges = 0;
+
+                      mutex.unlock();
+
+                      debugLog(
+                          "THREAD rescanning changes=%d",
+                          changes
+                      );
+
+                      scanDevices();
+                  }
+                  else {
+                      mutex.unlock();
+                  }
+
+                  /*
+                   * Commit pending single click.
+                   */
+                  long long nowMs =
+                      monotonicMilliseconds();
+
+                  if (
+                      pendingSingleClick &&
+                      nowMs >= singleClickDeadline
+                  ) {
+                      long long elapsed =
+                          nowMs -
+                          firstClickTime;
+
+                      debugLog(
+                          "SINGLEDOUBLE timeout elapsed=%lldms -> nextPage",
+                          elapsed
+                      );
+
+                      pendingSingleClick = false;
+                      firstClickTime = 0;
+                      singleClickDeadline = 0;
+
+                      invokeMainWindowController(
+                          "nextPage"
+                      );
+                  }
+
+                  /*
+                   * Nothing connected yet.
+                   *
+                   * Don't block forever: poll at one second
+                   * so debugging always continues.
+                   */
+                  if (devices.empty()) {
+                      debugLog(
+                          "THREAD no devices; sleeping 1000ms"
+                      );
+
+                      QThread::msleep(1000);
+
+                      scanDevices();
+
+                      continue;
+                  }
+
+                  /*
+                   * Calculate select timeout.
+                   */
+                  if (pendingSingleClick) {
+                      long long remaining =
+                          singleClickDeadline -
+                          monotonicMilliseconds();
+
+                      if (remaining < 0) {
+                          remaining = 0;
+                      }
+
+                      tv.tv_sec =
+                          remaining / 1000;
+
+                      tv.tv_usec =
+                          (remaining % 1000) *
+                          1000;
+                  }
+                  else {
+                      tv.tv_sec = 1;
+                      tv.tv_usec = 0;
+                  }
+
+                  FD_ZERO(&rfds);
+
+                  int maxfd = -1;
+
+                  foreach(
+                      const Device &device,
+                      devices.values()
+                  ) {
+                      FD_SET(
+                          device.fd,
+                          &rfds
+                      );
+
+                      if (device.fd > maxfd) {
+                          maxfd =
+                              device.fd;
+                      }
+                  }
+
+                  debugLog(
+                      "SELECT begin devices=%d maxfd=%d pending=%d",
+                      devices.size(),
+                      maxfd,
+                      pendingSingleClick ? 1 : 0
+                  );
+
+                  errno = 0;
+
+                  ret = select(
+                      maxfd + 1,
+                      &rfds,
+                      NULL,
+                      NULL,
+                      &tv
+                  );
+
+                  if (ret < 0) {
+                      debugLog(
+                          "SELECT FAIL errno=%d error='%s'",
+                          errno,
+                          strerror(errno)
+                      );
+
+                      continue;
+                  }
+
+                  if (ret == 0) {
+                      /*
+                       * Timeout is normal.
+                       * Next loop commits pending click.
+                       */
+                      continue;
+                  }
+
+                  debugLog(
+                      "SELECT ready=%d",
+                      ret
+                  );
+
+                  /*
+                   * Process devices.
+                   */
+                  for (
+                      auto it = devices.begin();
+                      it != devices.end();
+                  ) {
+                      Device &device =
+                          it.value();
+
+                      if (
+                          !FD_ISSET(
+                              device.fd,
+                              &rfds
+                          )
+                      ) {
+                          it++;
+                          continue;
+                      }
+
+                      errno = 0;
+
+                      ret = read(
+                          device.fd,
+                          &e,
+                          sizeof(e)
+                      );
+
+                      if (
+                          ret <
+                          (int)sizeof(e)
+                      ) {
+                          debugLog(
+                              "DEVICE LOST fd=%d read=%d errno=%d error='%s'",
+                              device.fd,
+                              ret,
+                              errno,
+                              strerror(errno)
+                          );
+
+                          close(device.fd);
+
+                          it =
+                              devices.erase(it);
+
+                          continue;
+                      }
+
+                      debugLog(
+                          "EVENT type=%u code=%u value=%d",
+                          (unsigned)e.type,
+                          (unsigned)e.code,
+                          (int)e.value
+                      );
+
+                      /*
+                       * Original device-loss event.
+                       */
+                      if (
+                          e.type == 0x00 &&
+                          e.code == 0x00 &&
+                          e.value == 0x0001
+                      ) {
+                          debugLog(
+                              "DEVICE LOST synthetic fd=%d",
+                              device.fd
+                          );
+
+                          close(device.fd);
+
+                          it =
+                              devices.erase(it);
+
+                          continue;
+                      }
+
+                      for (
+                          int c = 0;
+                          c < device.cfg.size();
+                          c++
+                      ) {
+                          auto &pair =
+                              device.cfg[c];
+
+                          struct input_event test =
+                              pair.first;
+
+                          if (
+                              e.type ==
+                                  test.type &&
+                              e.code ==
+                                  test.code &&
+                              e.value ==
+                                  test.value
+                          ) {
+                              QByteArray method =
+                                  pair.second
+                                      .toUtf8();
+
+                              debugLog(
+                                  "MATCH method='%s' type=%u code=%u value=%d",
+                                  method.constData(),
+                                  (unsigned)e.type,
+                                  (unsigned)e.code,
+                                  (int)e.value
+                              );
+
+                              if (
+                                  method ==
+                                  "singleDouble"
+                              ) {
+                                  long long clickTime =
+                                      monotonicMilliseconds();
+
+                                  /*
+                                   * Old pending click already
+                                   * expired.
+                                   */
+                                  if (
+                                      pendingSingleClick &&
+                                      clickTime >
+                                          singleClickDeadline
+                                  ) {
+                                      long long elapsed =
+                                          clickTime -
+                                          firstClickTime;
+
+                                      debugLog(
+                                          "SINGLEDOUBLE expired elapsed=%lldms -> nextPage",
+                                          elapsed
+                                      );
+
+                                      pendingSingleClick =
+                                          false;
+
+                                      firstClickTime = 0;
+                                      singleClickDeadline = 0;
+
+                                      invokeMainWindowController(
+                                          "nextPage"
+                                      );
+                                  }
+
+                                  /*
+                                   * Second click.
+                                   */
+                                  if (
+                                      pendingSingleClick
+                                  ) {
+                                      long long elapsed =
+                                          clickTime -
+                                          firstClickTime;
+
+                                      debugLog(
+                                          "SINGLEDOUBLE second click elapsed=%lldms -> prevPage",
+                                          elapsed
+                                      );
+
+                                      pendingSingleClick =
+                                          false;
+
+                                      firstClickTime = 0;
+                                      singleClickDeadline = 0;
+
+                                      invokeMainWindowController(
+                                          "prevPage"
+                                      );
+                                  }
+                                  else {
+                                      /*
+                                       * First click.
+                                       */
+                                      pendingSingleClick =
+                                          true;
+
+                                      firstClickTime =
+                                          clickTime;
+
+                                      singleClickDeadline =
+                                          clickTime +
+                                          DOUBLE_CLICK_MS;
+
+                                      debugLog(
+                                          "SINGLEDOUBLE first click time=%lld deadline=%lld window=%lldms",
+                                          firstClickTime,
+                                          singleClickDeadline,
+                                          DOUBLE_CLICK_MS
+                                      );
+                                  }
+                              }
+                              else {
+                                  debugLog(
+                                      "NORMAL invoke method='%s'",
+                                      method.constData()
+                                  );
+
+                                  invokeMainWindowController(
+                                      method.constData()
+                                  );
+                              }
+                          }
+                      }
+
+                      it++;
+                  }
+              }
+          }
+
+          static int btpt_init()
+          {
+              mkdir(
+                  BTPT_DIR,
+                  0755
+              );
+
+              /*
+               * Reset debug log on every Nickel start.
+               */
+              FILE *debug =
+                  fopen(
+                      "/mnt/onboard/btpt-debug.txt",
+                      "w"
+                  );
+
+              if (debug) {
+                  fputs(
+                      "=== kobo-btpt single-double debug v5 ===\n",
+                      debug
+                  );
+
+                  fclose(debug);
+              }
+
+              debugLog(
+                  "btpt_init reached"
+              );
+
+              debugLog(
+                  "BUILD single-double-debug-v5"
+              );
+
+              debugLog(
+                  "DOUBLE_CLICK_MS=300"
+              );
+
+              FILE *marker =
+                  fopen(
+                      "/mnt/onboard/btpt-loaded.txt",
+                      "w"
+                  );
+
+              if (marker) {
+                  fputs(
+                      "kobo-btpt single-double-debug-v5\n",
+                      marker
+                  );
+
+                  fclose(marker);
+              }
+
+              BluetoothPageTurner *btpt =
+                  new BluetoothPageTurner();
+
+              QObject::connect(
+                  btpt,
+                  &QThread::finished,
+                  btpt,
+                  &QObject::deleteLater
+              );
+
+              btpt->start();
+
+              debugLog(
+                  "BluetoothPageTurner thread started"
+              );
+
+              return 0;
+          }
+
+          static struct nh_info btpt_info = {
+              .name =
+                  "BluetoothPageTurner",
+
+              .desc =
+                  "Turn pages with Bluetooth device",
+
+              .uninstall_flag =
+                  BTPT_DIR "/uninstall",
           };
 
-          """
+          static struct nh_hook btpt_hook[] = {
+              {0},
+          };
+
+          static struct nh_dlsym btpt_dlsym[] = {
+              {
+                  .name =
+                      "_ZN20MainWindowController14sharedInstanceEv",
+
+                  .out =
+                      nh_symoutptr(
+                          MainWindowController_sharedInstance
+                      )
+              },
+
+              {
+                  .name =
+                      "_ZNK20MainWindowController11currentViewEv",
+
+                  .out =
+                      nh_symoutptr(
+                          MainWindowController_currentView
+                      )
+              },
+
+              {0},
+          };
+
+          NickelHook(
+              .init  = btpt_init,
+              .info  = &btpt_info,
+              .hook  = btpt_hook,
+              .dlsym = btpt_dlsym,
           )
+          EOF
 
-          # ============================================================
-          # 19. WRITE PATCHED SOURCE
-          # ============================================================
+      - name: Verify generated source
+        shell: bash
+        run: |
+          echo "=== SOURCE CHECK ==="
 
-          cc_path.write_text(cc)
-          h_path.write_text(h)
+          grep -F 'singleDouble' src/btpt.cc
+          grep -F 'SINGLEDOUBLE first click' src/btpt.cc
+          grep -F 'SINGLEDOUBLE second click' src/btpt.cc
+          grep -F 'SINGLEDOUBLE timeout' src/btpt.cc
+          grep -F 'ADD config-open OK' src/btpt.cc
+          grep -F 'CONFIG line=' src/btpt.cc
+          grep -F 'ADD input-open OK' src/btpt.cc
+          grep -F 'DEVICE ACQUIRED' src/btpt.cc
+          grep -F 'EVENT type=' src/btpt.cc
+          grep -F 'MATCH method=' src/btpt.cc
+          grep -F 'INVOKE done' src/btpt.cc
 
-          # ============================================================
-          # 20. VALIDATE EXACT GENERATED SOURCE
-          #
-          # These strings are now deliberately single C++ literals.
-          # No adjacent-string mismatch like v3.
-          # ============================================================
+          if grep -Fq 'BluetoothHeartbeat' src/btpt.cc; then
+            echo "ERROR: BluetoothHeartbeat remains"
+            exit 1
+          fi
 
-          print("=== VERIFY PATCH V4 ===")
+          if grep -Fq 'PowerManager' src/btpt.cc; then
+            echo "ERROR: PowerManager remains"
+            exit 1
+          fi
 
-          forbidden_cc = [
-              "BluetoothHeartbeat",
-              "PowerManager",
-              "TimeEvent",
-              "TimeLastUsedUpdater",
-              "emit notify",
-              "last_event",
-              "bluetoothHeartbeat",
-          ]
+          if grep -Fq 'TimeLastUsedUpdater' src/btpt.cc; then
+            echo "ERROR: TimeLastUsedUpdater remains"
+            exit 1
+          fi
 
-          for item in forbidden_cc:
-              assert item not in cc, f"Forbidden symbol remains: {item}"
-              print("removed:", item)
-
-          forbidden_h = [
-              "TimeLastUsedUpdater",
-              "void notify();",
-          ]
-
-          for item in forbidden_h:
-              assert item not in h, f"Forbidden header symbol remains: {item}"
-              print("removed from header:", item)
-
-          required = [
-              'if (method == "singleDouble")',
-              "const long long DOUBLE_CLICK_MS = 300;",
-              "SINGLEDOUBLE first click window=%lldms",
-              "SINGLEDOUBLE second click elapsed=%lldms -> prevPage",
-              "SINGLEDOUBLE timeout elapsed=%lldms -> nextPage",
-              "SINGLEDOUBLE expired first click elapsed=%lldms -> nextPage",
-              'invokeMainWindowController("nextPage");',
-              '"prevPage"',
-              "/mnt/onboard/btpt-debug.txt",
-              "EVENT type=%u code=%u value=%d",
-              "MATCH method='%s' type=%u code=%u value=%d",
-              "INVOKE request method='%s' view='%s'",
-              "INVOKE result method='%s' success=%d",
-              "performing initial device scan",
-              "single-double-debug-v4",
-          ]
-
-          for item in required:
-              assert item in cc, f"Required code missing: {item}"
-              print("OK:", item)
-
-          # Make sure braces were not obviously damaged.
-          open_braces = cc.count("{")
-          close_braces = cc.count("}")
-
-          print("C++ braces:", open_braces, close_braces)
-
-          assert open_braces == close_braces, (
-              f"Unbalanced braces: {open_braces} != {close_braces}"
-          )
-
-          print("")
-          print("Permanent debug: OK")
-          print("Kobo 4.45 compatibility: OK")
-          print("Initial device scan: OK")
-          print("Single click -> nextPage: OK")
-          print("Double click -> prevPage: OK")
-          print("Expired-click handling: OK")
-          print("Double-click window: 300 ms")
-          print("SOURCE PATCH V4 VERIFIED")
+          echo "SOURCE CHECK OK"
 
       - name: Fix Linux input header
         run: |
@@ -771,15 +1300,15 @@ jobs:
             ghcr.io/pgaskin/nickeltc:1.0 \
             clean all koboroot
 
-      - name: Verify KoboRoot
+      - name: Verify build
         run: |
           echo "=== BUILD RESULT ==="
-          ls -lh KoboRoot.tgz
           test -f KoboRoot.tgz
+          ls -lh KoboRoot.tgz
           echo "KoboRoot.tgz OK"
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kobo-btpt-single-double-debug-v4
+          name: kobo-btpt-single-double-debug-v5
           path: KoboRoot.tgz
