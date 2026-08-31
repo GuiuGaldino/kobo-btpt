@@ -8,11 +8,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout known kobo-btpt source
+      - name: Checkout PR32
         uses: actions/checkout@v4
         with:
           repository: pgaskin/kobo-btpt
-          ref: be1f775
+          ref: update-nh
           submodules: recursive
 
       - name: Patch Kobo 4.45 single-double permanent debug
