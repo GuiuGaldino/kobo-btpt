@@ -1,31 +1,20 @@
 name: Build kobo-btpt PR32
-
 on:
-workflow_dispatch:
-
+  workflow_dispatch:
 jobs:
-build:
-runs-on: ubuntu-latest
-
-steps:
-  - name: Checkout PR32
-    uses: actions/checkout@v4
-    with:
-      repository: pgaskin/kobo-btpt
-      ref: update-nh
-      submodules: recursive
-
-  - name: Build
-    run: |
-      docker run --rm \
-        -v "$PWD:$PWD" \
-        -w "$PWD" \
-        --entrypoint make \
-        ghcr.io/pgaskin/nickeltc:1.0 \
-        clean all koboroot
-
-  - name: Upload artifact
-    uses: actions/upload-artifact@v4
-    with:
-      name: kobo-btpt-pr32
-      path: KoboRoot.tgz
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: pgaskin/kobo-btpt
+          ref: update-nh
+          submodules: recursive
+      - name: Build
+        run: make clean all koboroot
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: kobo-btpt-pr32
+          path: KoboRoot.tgz
