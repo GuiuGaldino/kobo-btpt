@@ -1,0 +1,40 @@
+name: Build kobo-btpt PR32
+
+on:
+workflow_dispatch:
+
+jobs:
+build:
+runs-on: ubuntu-latest
+
+```
+steps:
+  - name: Checkout PR #32
+    uses: actions/checkout@v4
+    with:
+      repository: pgaskin/kobo-btpt
+      ref: update-nh
+      submodules: recursive
+
+  - name: Build with NickelTC
+    run: |
+      docker run \
+        --volume="$PWD:$PWD" \
+        --workdir="$PWD" \
+        --entrypoint=make \
+        --rm \
+        ghcr.io/pgaskin/nickeltc:1.0 \
+        clean all koboroot
+
+  - name: Check output
+    run: |
+      ls -lah
+      test -f KoboRoot.tgz
+
+  - name: Upload KoboRoot.tgz
+    uses: actions/upload-artifact@v4
+    with:
+      name: kobo-btpt-pr32
+      path: KoboRoot.tgz
+      if-no-files-found: error
+```
