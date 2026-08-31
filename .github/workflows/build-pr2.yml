@@ -8,27 +8,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout PR32
         uses: actions/checkout@v4
         with:
           repository: pgaskin/kobo-btpt
           ref: update-nh
           submodules: recursive
 
-      - name: Build with NickelTC
+      - name: Fix input-event-codes header
         run: |
           docker run --rm \
             -v "$PWD:/src" \
             -w /src \
             --entrypoint bash \
-            ghcr.io/pgaskin/nickeltc:1 \
-            -lc '
-              SYSROOT="$(arm-nickel-linux-gnueabihf-g++ -print-sysroot)"
-              echo "Nickel sysroot: $SYSROOT"
-              mkdir -p "$SYSROOT/usr/include/linux"
-              cp /usr/include/linux/input-event-codes.h "$SYSROOT/usr/include/linux/input-event-codes.h"
-              make clean all koboroot
-            '
+            ghcr.io/pgaskin/nickeltc:1.0 \
+            -c 'cp /usr/include/linux/input-event-codes.h src/input-event-codes.h'
+
+          sed -i 's|<linux/input-event-codes.h>|"input-event-codes.h"|' src/eventcodes.cc
+
+      - name: Build with NickelTC
+        run: |
+          docker run --rm \
+            -v "$PWD:$PWD" \
+            -w "$PWD" \
+            --entrypoint make \
+            ghcr.io/pgaskin/nickeltc:1.0 \
+            clean all koboroot
 
       - name: Verify KoboRoot
         run: |
