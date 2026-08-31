@@ -21,7 +21,7 @@ jobs:
             -v "$PWD:/src" \
             -w /src \
             --entrypoint make \
-            geek1011/nickeltc \
+            ghcr.io/pgaskin/nickeltc:1 \
             clean all koboroot
 
       - name: Upload
