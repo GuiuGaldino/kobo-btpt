@@ -1,4 +1,4 @@
-name: Build kobo-btpt PR32-2
+name: Build kobo-btpt PR32
 
 on:
 workflow_dispatch:
@@ -6,15 +6,15 @@ workflow_dispatch:
 jobs:
 build:
 runs-on: ubuntu-latest
-steps:
-- name: Checkout PR32
-uses: actions/checkout@v4
-with:
-repository: pgaskin/kobo-btpt
-ref: update-nh
-submodules: recursive
 
-```
+steps:
+  - name: Checkout PR32
+    uses: actions/checkout@v4
+    with:
+      repository: pgaskin/kobo-btpt
+      ref: update-nh
+      submodules: recursive
+
   - name: Build
     run: |
       docker run --rm \
@@ -29,4 +29,3 @@ submodules: recursive
     with:
       name: kobo-btpt-pr32
       path: KoboRoot.tgz
-```
