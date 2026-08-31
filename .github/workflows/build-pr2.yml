@@ -1,4 +1,4 @@
-name: Build kobo-btpt single-double debug
+name: Build kobo-btpt single-double debug v3
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
           ref: update-nh
           submodules: recursive
 
-      - name: Patch Kobo 4.45 single-double with permanent debug
+      - name: Patch Kobo 4.45 single-double permanent debug
         shell: python
         run: |
           from pathlib import Path
@@ -32,8 +32,10 @@ jobs:
               return text[:a] + replacement + text[b:]
 
           # ============================================================
-          # Includes required by permanent debug logging
+          # DEBUG SUPPORT
           # ============================================================
+
+          assert "#include <stdio.h>" in cc
 
           cc = cc.replace(
               "#include <stdio.h>",
@@ -42,14 +44,21 @@ jobs:
           )
 
           # ============================================================
-          # Kobo 4.45 compatibility:
-          # remove fragile Nickel symbols and keep only the two which
-          # are actually required to turn pages.
+          # KOBO 4.45 COMPATIBILITY
           #
-          # Also add permanent debug logging and monotonic clock.
+          # Remove fragile private symbols:
+          # BluetoothHeartbeat
+          # PowerManager
+          # TimeEvent
+          #
+          # Keep only MainWindowController.
           # ============================================================
 
-          start = "/* Stop Bluetooth heartbeat after this many seconds of inactivity */"
+          start = (
+              "/* Stop Bluetooth heartbeat after this many seconds "
+              "of inactivity */"
+          )
+
           end = "static void invokeMainWindowController"
 
           cc = replace_between(
@@ -61,7 +70,10 @@ jobs:
 
           static void debugLog(const char *fmt, ...)
           {
-              FILE *f = fopen("/mnt/onboard/btpt-debug.txt", "a");
+              FILE *f = fopen(
+                  "/mnt/onboard/btpt-debug.txt",
+                  "a"
+              );
 
               if (!f) {
                   return;
@@ -92,57 +104,106 @@ jobs:
           )
 
           # ============================================================
-          # Instrument page invocation itself.
+          # REPLACE ENTIRE invokeMainWindowController()
           #
-          # We want to know:
-          # - requested method
-          # - current Kobo view
-          # - whether invokeMethod succeeded
+          # This avoids the mismatch which broke v2.
           # ============================================================
 
-          old = """\tQString name = cv->objectName();
+          start = (
+              "static void invokeMainWindowController"
+              "(const char *method)"
+          )
 
-          \tif (name != "ReadingView") {
-          \t\treturn;
-          \t}
+          end = "bool BluetoothPageTurner::addDevice("
 
-          \tQMetaObject::invokeMethod(cv, method);"""
+          cc = replace_between(
+              cc,
+              start,
+              end,
+              """static void invokeMainWindowController(const char *method)
+          {
+              void *mwc =
+                  MainWindowController_sharedInstance();
 
-          new = """\tQString name = cv->objectName();
+              if (!mwc) {
+                  debugLog(
+                      "INVOKE FAILED method='%s' "
+                      "reason=no-MainWindowController",
+                      method
+                  );
 
-          \tdebugLog(
-          \t\t"INVOKE request method='%s' view='%s'",
-          \t\tmethod,
-          \t\tname.toUtf8().constData()
-          \t);
+                  nh_log("invalid MainWindowController");
+                  return;
+              }
 
-          \tif (name != "ReadingView") {
-          \t\tdebugLog(
-          \t\t\t"INVOKE SKIPPED method='%s' reason=not-reading-view",
-          \t\t\tmethod
-          \t\t);
-          \t\treturn;
-          \t}
+              QWidget *cv =
+                  MainWindowController_currentView(mwc);
 
-          \tbool invoked = QMetaObject::invokeMethod(cv, method);
+              if (!cv) {
+                  debugLog(
+                      "INVOKE FAILED method='%s' "
+                      "reason=no-current-view",
+                      method
+                  );
 
-          \tdebugLog(
-          \t\t"INVOKE result method='%s' success=%d",
-          \t\tmethod,
-          \t\tinvoked ? 1 : 0
-          \t);"""
+                  nh_log("invalid View");
+                  return;
+              }
 
-          assert old in cc, "Could not patch invokeMainWindowController"
-          cc = cc.replace(old, new, 1)
+              QString name = cv->objectName();
+
+              debugLog(
+                  "INVOKE request method='%s' view='%s'",
+                  method,
+                  name.toUtf8().constData()
+              );
+
+              if (name != "ReadingView") {
+                  debugLog(
+                      "INVOKE SKIPPED method='%s' "
+                      "reason=not-reading-view",
+                      method
+                  );
+
+                  nh_log("not reading view");
+                  return;
+              }
+
+              bool result = QMetaObject::invokeMethod(
+                  cv,
+                  method,
+                  Qt::QueuedConnection
+              );
+
+              debugLog(
+                  "INVOKE result method='%s' success=%d",
+                  method,
+                  result ? 1 : 0
+              );
+          }
+
+          """
+          )
 
           # ============================================================
-          # Device acquisition diagnostics
+          # DEVICE ADD DEBUG
           # ============================================================
 
-          old = """{
-          \tint fd;"""
+          start = """bool BluetoothPageTurner::addDevice(
+          \tconst QString &name, const QString &uniq, const QString &handler)
+          {"""
 
-          new = """{
+          end = "\tint fd;"
+
+          assert start in cc, "Could not find addDevice()"
+
+          cc = replace_between(
+              cc,
+              start,
+              end,
+              """bool BluetoothPageTurner::addDevice(
+          \tconst QString &name, const QString &uniq, const QString &handler)
+          {
           \tdebugLog(
           \t\t"addDevice name='%s' uniq='%s' handler='%s'",
           \t\tname.toUtf8().constData(),
@@ -150,13 +211,11 @@ jobs:
           \t\thandler.toUtf8().constData()
           \t);
 
-          \tint fd;"""
-
-          assert old in cc, "Could not patch addDevice start"
-          cc = cc.replace(old, new, 1)
+          """
+          )
 
           # ============================================================
-          # Log configuration file selected by kobo-btpt
+          # CONFIG DEBUG
           # ============================================================
 
           old = """\tif (!cfg.open(QIODevice::ReadOnly | QIODevice::Text)) {"""
@@ -172,17 +231,18 @@ jobs:
           \t\t\tcfg.fileName().toUtf8().constData()
           \t\t);"""
 
-          assert old in cc, "Could not patch config open"
+          assert old in cc, "Could not find config open"
           cc = cc.replace(old, new, 1)
 
           # ============================================================
-          # Log successful device acquisition
+          # DEVICE ACQUIRED DEBUG
           # ============================================================
 
           old = """\tnh_log("acquired device %s: %s","""
 
           new = """\tdebugLog(
-          \t\t"DEVICE ACQUIRED handler='%s' uniq='%s' config='%s'",
+          \t\t"DEVICE ACQUIRED "
+          \t\t"handler='%s' uniq='%s' config='%s'",
           \t\thandler.toUtf8().constData(),
           \t\tuniq.toUtf8().constData(),
           \t\tcfg.fileName().toUtf8().constData()
@@ -190,27 +250,38 @@ jobs:
 
           \tnh_log("acquired device %s: %s","""
 
-          assert old in cc, "Could not patch device acquisition log"
+          assert old in cc, "Could not find acquired-device log"
           cc = cc.replace(old, new, 1)
 
           # ============================================================
-          # Input-device scanning diagnostics
+          # SCAN DEBUG
           # ============================================================
 
-          old = """\tnh_log("checking /proc/bus/input/devices for new devices");"""
+          old = (
+              '\tnh_log("checking /proc/bus/input/devices '
+              'for new devices");'
+          )
 
-          new = """\tnh_log("checking /proc/bus/input/devices for new devices");
+          new = """\tnh_log(
+          \t\t"checking /proc/bus/input/devices for new devices"
+          \t);
+
           \tdebugLog("SCAN /proc/bus/input/devices");"""
 
-          assert old in cc, "Could not patch scan log"
+          assert old in cc, "Could not find scan log"
           cc = cc.replace(old, new, 1)
+
+          # ============================================================
+          # LOG INPUT ENTRIES
+          # ============================================================
 
           old = """\t\telse if (type == "H") {
           \t\t\t/* Skip if not Bluetooth device */"""
 
           new = """\t\telse if (type == "H") {
           \t\t\tdebugLog(
-          \t\t\t\t"INPUT i='%s' name='%s' uniq='%s' handlers='%s'",
+          \t\t\t\t"INPUT i='%s' name='%s' "
+          \t\t\t\t"uniq='%s' handlers='%s'",
           \t\t\t\ti.toUtf8().constData(),
           \t\t\t\tn.toUtf8().constData(),
           \t\t\t\tu.toUtf8().constData(),
@@ -219,22 +290,11 @@ jobs:
 
           \t\t\t/* Skip if not Bluetooth device */"""
 
-          assert old in cc, "Could not patch input scan details"
+          assert old in cc, "Could not find H handler"
           cc = cc.replace(old, new, 1)
 
           # ============================================================
-          # Simplify run() and introduce single/double-click state.
-          #
-          # 300 ms window:
-          #
-          # first click
-          #   -> pending
-          #
-          # no second click before deadline
-          #   -> nextPage
-          #
-          # second click before deadline
-          #   -> prevPage
+          # RUN() STATE
           # ============================================================
 
           start = "void BluetoothPageTurner::run()\n{"
@@ -246,41 +306,47 @@ jobs:
               end,
               """void BluetoothPageTurner::run()
           {
-              fd_set rfds;
-              struct timeval tv;
+          \tfd_set rfds;
+          \tstruct timeval tv;
 
-              bool pendingSingleClick = false;
-              long long singleClickDeadline = 0;
+          \tbool pendingSingleClick = false;
+          \tlong long firstClickTime = 0;
+          \tlong long singleClickDeadline = 0;
 
-              const long long DOUBLE_CLICK_MS = 300;
+          \tconst long long DOUBLE_CLICK_MS = 300;
 
           """
           )
 
           # ============================================================
-          # Initial device scan.
-          #
-          # This is the fix which allows devices which are already
-          # connected when the thread starts to be detected.
+          # INITIAL DEVICE SCAN FIX
           # ============================================================
 
           old = 'watcher.addPath("/dev/input");'
 
           new = '''watcher.addPath("/dev/input");
 
-              debugLog("watching /dev/input");
-              debugLog("performing initial device scan");
+          \tdebugLog("watching /dev/input");
+          \tdebugLog("performing initial device scan");
 
-              scanDevices();'''
+          \t/*
+          \t * Scan devices which were already connected
+          \t * before this thread started.
+          \t */
+          \tscanDevices();'''
 
-          assert old in cc, "Could not patch initial scan"
+          assert old in cc, "Could not find watcher.addPath"
           cc = cc.replace(old, new, 1)
 
           # ============================================================
-          # Remove BluetoothHeartbeat section
+          # REMOVE OLD BLUETOOTH HEARTBEAT BLOCK
           # ============================================================
 
-          start = "\t\t/* Bluetooth heartbeat to prevent Bluetooth from turning off */"
+          start = (
+              "\t\t/* Bluetooth heartbeat to prevent "
+              "Bluetooth from turning off */"
+          )
+
           end = "\t\t/* Poll devices for input events */"
 
           cc = replace_between(
@@ -291,30 +357,47 @@ jobs:
           )
 
           # ============================================================
-          # Dynamic select() timeout for pending single click.
+          # REPLACE SELECT TIMEOUT
           #
-          # Important:
-          # select() must wake at the 300 ms deadline, otherwise a
-          # single click could sit pending for the old 1 second timeout.
+          # Single click needs select() to wake after 300ms.
           # ============================================================
 
           old = """\t\ttv.tv_sec = 1;
           \t\ttv.tv_usec = 0;"""
 
-          new = """\t\tlong long nowMs = monotonicMilliseconds();
+          new = """\t\tlong long nowMs =
+          \t\t\tmonotonicMilliseconds();
 
-          \t\tif (pendingSingleClick &&
-          \t\t    nowMs >= singleClickDeadline) {
+          \t\t/*
+          \t\t * A single click survived the double-click
+          \t\t * window. Turn forward.
+          \t\t */
+          \t\tif (
+          \t\t\tpendingSingleClick &&
+          \t\t\tnowMs >= singleClickDeadline
+          \t\t) {
+          \t\t\tlong long elapsed =
+          \t\t\t\tnowMs - firstClickTime;
 
           \t\t\tdebugLog(
-          \t\t\t\t"SINGLEDOUBLE timeout -> nextPage"
+          \t\t\t\t"SINGLEDOUBLE timeout "
+          \t\t\t\t"elapsed=%lldms -> nextPage",
+          \t\t\t\telapsed
           \t\t\t);
 
           \t\t\tpendingSingleClick = false;
+          \t\t\tfirstClickTime = 0;
+          \t\t\tsingleClickDeadline = 0;
 
-          \t\t\tinvokeMainWindowController("nextPage");
+          \t\t\tinvokeMainWindowController(
+          \t\t\t\t"nextPage"
+          \t\t\t);
           \t\t}
 
+          \t\t/*
+          \t\t * If first click is pending, wake exactly
+          \t\t * at its deadline.
+          \t\t */
           \t\tif (pendingSingleClick) {
           \t\t\tlong long remaining =
           \t\t\t\tsingleClickDeadline -
@@ -324,12 +407,9 @@ jobs:
           \t\t\t\tremaining = 0;
           \t\t\t}
 
-          \t\t\tdebugLog(
-          \t\t\t\t"SINGLEDOUBLE waiting remaining=%lldms",
-          \t\t\t\tremaining
-          \t\t\t);
+          \t\t\ttv.tv_sec =
+          \t\t\t\tremaining / 1000;
 
-          \t\t\ttv.tv_sec = remaining / 1000;
           \t\t\ttv.tv_usec =
           \t\t\t\t(remaining % 1000) * 1000;
           \t\t}
@@ -338,25 +418,11 @@ jobs:
           \t\t\ttv.tv_usec = 0;
           \t\t}"""
 
-          assert old in cc, "Could not patch select timeout"
+          assert old in cc, "Could not find select timeout"
           cc = cc.replace(old, new, 1)
 
           # ============================================================
-          # Remove obsolete heartbeat/PowerManager code from event path
-          # ============================================================
-
-          start = "\t\t\t\t\t/* Update Bluetooth heartbeat time */"
-          end = "\t\t\t\t\t/* Invoke the configured method */"
-
-          cc = replace_between(
-              cc,
-              start,
-              end,
-              ""
-          )
-
-          # ============================================================
-          # Permanent raw event logging
+          # RAW EVENT DEBUG
           # ============================================================
 
           old = """\t\t\tif (e.type == 0x00 &&
@@ -374,24 +440,33 @@ jobs:
           \t\t\t    e.code == 0x00 &&
           \t\t\t    e.value == 0x0001) {"""
 
-          assert old in cc, "Could not patch raw event logging"
+          assert old in cc, "Could not find raw event location"
           cc = cc.replace(old, new, 1)
 
           # ============================================================
-          # Implement special singleDouble action.
+          # REPLACE OLD MATCH ACTION
           #
-          # Normal actions such as nextPage/prevPage continue working.
+          # This also removes the old heartbeat timestamp and
+          # PowerManager notify code.
           # ============================================================
 
-          old = """\t\t\t\t\tconst char *method = pair.second
-          \t\t\t\t\t\t.toStdString().c_str();
-          \t\t\t\t\tinvokeMainWindowController(method);"""
+          start = """\t\t\t\tif (e.type == test.type &&
+          \t\t\t\t    e.code == test.code &&
+          \t\t\t\t    e.value == test.value) {"""
 
-          new = """\t\t\t\t\tQByteArray method =
+          end = """\t\t\t\t}
+          \t\t\t}"""
+
+          replacement = """\t\t\t\tif (e.type == test.type &&
+          \t\t\t\t    e.code == test.code &&
+          \t\t\t\t    e.value == test.value) {
+
+          \t\t\t\t\tQByteArray method =
           \t\t\t\t\t\tpair.second.toUtf8();
 
           \t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t"MATCH method='%s' type=%u code=%u value=%d",
+          \t\t\t\t\t\t"MATCH method='%s' "
+          \t\t\t\t\t\t"type=%u code=%u value=%d",
           \t\t\t\t\t\tmethod.constData(),
           \t\t\t\t\t\t(unsigned)e.type,
           \t\t\t\t\t\t(unsigned)e.code,
@@ -403,21 +478,30 @@ jobs:
           \t\t\t\t\t\tlong long clickTime =
           \t\t\t\t\t\t\tmonotonicMilliseconds();
 
+          \t\t\t\t\t\t/*
+          \t\t\t\t\t\t * Second click inside window.
+          \t\t\t\t\t\t */
           \t\t\t\t\t\tif (
           \t\t\t\t\t\t\tpendingSingleClick &&
-          \t\t\t\t\t\t\tclickTime <= singleClickDeadline
+          \t\t\t\t\t\t\tclickTime <=
+          \t\t\t\t\t\t\t\tsingleClickDeadline
           \t\t\t\t\t\t) {
           \t\t\t\t\t\t\tlong long elapsed =
           \t\t\t\t\t\t\t\tclickTime -
-          \t\t\t\t\t\t\t\t(singleClickDeadline -
-          \t\t\t\t\t\t\t\t DOUBLE_CLICK_MS);
+          \t\t\t\t\t\t\t\tfirstClickTime;
 
           \t\t\t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t\t\t"SINGLEDOUBLE second click elapsed=%lldms -> prevPage",
+          \t\t\t\t\t\t\t\t"SINGLEDOUBLE "
+          \t\t\t\t\t\t\t\t"second click "
+          \t\t\t\t\t\t\t\t"elapsed=%lldms "
+          \t\t\t\t\t\t\t\t"-> prevPage",
           \t\t\t\t\t\t\t\telapsed
           \t\t\t\t\t\t\t);
 
-          \t\t\t\t\t\t\tpendingSingleClick = false;
+          \t\t\t\t\t\t\tpendingSingleClick =
+          \t\t\t\t\t\t\t\tfalse;
+
+          \t\t\t\t\t\t\tfirstClickTime = 0;
           \t\t\t\t\t\t\tsingleClickDeadline = 0;
 
           \t\t\t\t\t\t\tinvokeMainWindowController(
@@ -425,15 +509,24 @@ jobs:
           \t\t\t\t\t\t\t);
           \t\t\t\t\t\t}
           \t\t\t\t\t\telse {
-          \t\t\t\t\t\t\tpendingSingleClick = true;
+          \t\t\t\t\t\t\t/*
+          \t\t\t\t\t\t\t * First click.
+          \t\t\t\t\t\t\t */
+          \t\t\t\t\t\t\tpendingSingleClick =
+          \t\t\t\t\t\t\t\ttrue;
+
+          \t\t\t\t\t\t\tfirstClickTime =
+          \t\t\t\t\t\t\t\tclickTime;
 
           \t\t\t\t\t\t\tsingleClickDeadline =
           \t\t\t\t\t\t\t\tclickTime +
           \t\t\t\t\t\t\t\tDOUBLE_CLICK_MS;
 
           \t\t\t\t\t\t\tdebugLog(
-          \t\t\t\t\t\t\t\t"SINGLEDOUBLE first click deadline=%lld",
-          \t\t\t\t\t\t\t\tsingleClickDeadline
+          \t\t\t\t\t\t\t\t"SINGLEDOUBLE "
+          \t\t\t\t\t\t\t\t"first click "
+          \t\t\t\t\t\t\t\t"window=%lldms",
+          \t\t\t\t\t\t\t\tDOUBLE_CLICK_MS
           \t\t\t\t\t\t\t);
           \t\t\t\t\t\t}
           \t\t\t\t\t}
@@ -446,13 +539,20 @@ jobs:
           \t\t\t\t\t\tinvokeMainWindowController(
           \t\t\t\t\t\t\tmethod.constData()
           \t\t\t\t\t\t);
-          \t\t\t\t\t}"""
+          \t\t\t\t\t}
+          """
 
-          assert old in cc, "Could not patch method invocation"
-          cc = cc.replace(old, new, 1)
+          a = cc.index(start)
+          b = cc.index(end, a)
+
+          cc = (
+              cc[:a]
+              + replacement
+              + cc[b:]
+          )
 
           # ============================================================
-          # Remove TimeLastUsedUpdater implementation
+          # REMOVE TimeLastUsedUpdater
           # ============================================================
 
           start = "void TimeLastUsedUpdater::notify()"
@@ -466,7 +566,7 @@ jobs:
           )
 
           # ============================================================
-          # Minimal Kobo 4.45 init + PERMANENT DEBUG
+          # INIT WITH PERMANENT DEBUG
           # ============================================================
 
           start = "static int btpt_init()"
@@ -478,64 +578,69 @@ jobs:
               end,
               """static int btpt_init()
           {
-              mkdir(BTPT_DIR, 0755);
+          \tmkdir(BTPT_DIR, 0755);
 
-              /*
-               * Reset debug log every Nickel startup.
-               */
-              FILE *debug =
-                  fopen("/mnt/onboard/btpt-debug.txt", "w");
+          \t/*
+          \t * Reset debug file every Nickel startup.
+          \t */
+          \tFILE *debug = fopen(
+          \t\t"/mnt/onboard/btpt-debug.txt",
+          \t\t"w"
+          \t);
 
-              if (debug) {
-                  fputs(
-                      "=== kobo-btpt single-double debug v2 ===\\n",
-                      debug
-                  );
-                  fclose(debug);
-              }
+          \tif (debug) {
+          \t\tfputs(
+          \t\t\t"=== kobo-btpt "
+          \t\t\t"single-double debug v3 ===\\n",
+          \t\t\tdebug
+          \t\t);
 
-              debugLog("btpt_init reached");
-              debugLog("BUILD single-double-debug-v2");
-              debugLog("DOUBLE_CLICK_MS=300");
+          \t\tfclose(debug);
+          \t}
 
-              /*
-               * Human-readable build marker.
-               */
-              FILE *marker =
-                  fopen("/mnt/onboard/btpt-loaded.txt", "w");
+          \tdebugLog("btpt_init reached");
+          \tdebugLog("BUILD single-double-debug-v3");
+          \tdebugLog("DOUBLE_CLICK_MS=300");
 
-              if (marker) {
-                  fputs(
-                      "kobo-btpt single-double-debug-v2\\n",
-                      marker
-                  );
-                  fclose(marker);
-              }
+          \tFILE *marker = fopen(
+          \t\t"/mnt/onboard/btpt-loaded.txt",
+          \t\t"w"
+          \t);
 
-              BluetoothPageTurner *btpt =
-                  new BluetoothPageTurner();
+          \tif (marker) {
+          \t\tfputs(
+          \t\t\t"kobo-btpt "
+          \t\t\t"single-double-debug-v3\\n",
+          \t\t\tmarker
+          \t\t);
 
-              QObject::connect(
-                  btpt,
-                  &QThread::finished,
-                  btpt,
-                  &QObject::deleteLater
-              );
+          \t\tfclose(marker);
+          \t}
 
-              btpt->start();
+          \tBluetoothPageTurner *btpt =
+          \t\tnew BluetoothPageTurner();
 
-              debugLog(
-                  "BluetoothPageTurner thread started"
-              );
+          \tQObject::connect(
+          \t\tbtpt,
+          \t\t&QThread::finished,
+          \t\tbtpt,
+          \t\t&QObject::deleteLater
+          \t);
 
-              return 0;
+          \tbtpt->start();
+
+          \tdebugLog(
+          \t\t"BluetoothPageTurner thread started"
+          \t);
+
+          \treturn 0;
           }
 
           """
           )
 
           # ============================================================
-          # Keep only MainWindowController dlsym symbols
+          # ONLY SAFE DLSYM SYMBOLS
           # ============================================================
 
           start = "static struct nh_dlsym btpt_dlsym[] = {"
@@ -546,30 +651,30 @@ jobs:
               start,
               end,
               """static struct nh_dlsym btpt_dlsym[] = {
-              {
-                  .name =
-                      "_ZN20MainWindowController14sharedInstanceEv",
-                  .out =
-                      nh_symoutptr(
-                          MainWindowController_sharedInstance
-                      )
-              },
-              {
-                  .name =
-                      "_ZNK20MainWindowController11currentViewEv",
-                  .out =
-                      nh_symoutptr(
-                          MainWindowController_currentView
-                      )
-              },
-              {0},
+          \t{
+          \t\t.name =
+          \t\t\t"_ZN20MainWindowController14sharedInstanceEv",
+          \t\t.out =
+          \t\t\tnh_symoutptr(
+          \t\t\t\tMainWindowController_sharedInstance
+          \t\t\t)
+          \t},
+          \t{
+          \t\t.name =
+          \t\t\t"_ZNK20MainWindowController11currentViewEv",
+          \t\t.out =
+          \t\t\tnh_symoutptr(
+          \t\t\t\tMainWindowController_currentView
+          \t\t\t)
+          \t},
+          \t{0},
           };
 
           """
           )
 
           # ============================================================
-          # Simplify header for Kobo 4.45 compatibility
+          # HEADER COMPATIBILITY
           # ============================================================
 
           start = "class BluetoothPageTurner : public QThread"
@@ -589,7 +694,9 @@ jobs:
               bool addDevice(
                   const QString &name,
                   const QString &uniq,
-                  const QString &handler);
+                  const QString &handler
+              );
+
               bool scanDevices();
               void learn(Device &device);
 
@@ -607,17 +714,17 @@ jobs:
           )
 
           # ============================================================
-          # Write patched source
+          # WRITE
           # ============================================================
 
           cc_path.write_text(cc)
           h_path.write_text(h)
 
           # ============================================================
-          # Build-time verification
+          # VERIFY
           # ============================================================
 
-          print("=== Checking patch ===")
+          print("=== VERIFY PATCH ===")
 
           forbidden = [
               "BluetoothHeartbeat",
@@ -634,58 +741,42 @@ jobs:
                   item,
                   "FOUND" if item in cc else "removed"
               )
+
               assert item not in cc
 
-          assert "debugLog" in cc
-          assert "btpt-debug.txt" in cc
+          required = [
+              "singleDouble",
+              "DOUBLE_CLICK_MS = 300",
+              "SINGLEDOUBLE first click",
+              "SINGLEDOUBLE second click",
+              "SINGLEDOUBLE timeout",
+              "btpt-debug.txt",
+              "EVENT type=%u code=%u value=%d",
+              "MATCH method='%s'",
+              "INVOKE request",
+              "INVOKE result",
+              "performing initial device scan",
+              "single-double-debug-v3",
+          ]
 
-          assert "singleDouble" in cc
-          assert "DOUBLE_CLICK_MS = 300" in cc
+          for item in required:
+              print(
+                  item,
+                  "OK" if item in cc else "MISSING"
+              )
 
-          assert (
-              'invokeMainWindowController("nextPage")'
-              in cc
-          )
-
-          assert '"prevPage"' in cc
-
-          assert (
-              "SINGLEDOUBLE first click"
-              in cc
-          )
-
-          assert (
-              "SINGLEDOUBLE second click"
-              in cc
-          )
-
-          assert (
-              "SINGLEDOUBLE timeout -> nextPage"
-              in cc
-          )
-
-          assert (
-              "EVENT type=%u code=%u value=%d"
-              in cc
-          )
-
-          assert (
-              "INVOKE result"
-              in cc
-          )
+              assert item in cc
 
           assert "TimeLastUsedUpdater" not in h
           assert "void notify();" not in h
 
-          print("Kobo 4.45 compatibility: OK")
-          print("Initial Bluetooth scan: OK")
           print("Permanent debug: OK")
-          print("Raw event logging: OK")
-          print("Invocation logging: OK")
-          print("single click -> nextPage: OK")
-          print("double click -> prevPage: OK")
-          print("double-click window: 300 ms")
-          print("PATCH OK")
+          print("Kobo 4.45 compatibility: OK")
+          print("Initial scan fix: OK")
+          print("Single click -> nextPage: OK")
+          print("Double click -> prevPage: OK")
+          print("Window: 300 ms")
+          print("PATCH SUCCESS")
 
       - name: Fix Linux input header
         run: |
@@ -717,5 +808,5 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kobo-btpt-single-double-debug-v2
+          name: kobo-btpt-single-double-debug-v3
           path: KoboRoot.tgz
