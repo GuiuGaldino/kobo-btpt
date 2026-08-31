@@ -27,159 +27,159 @@ jobs:
           cc = cc_path.read_text()
           h = h_path.read_text()
 
-          # Remove BluetoothHeartbeat / PowerManager / TimeEvent symbols.
-          cc = cc.replace(
-          '''/* Stop Bluetooth heartbeat after this many seconds of inactivity */
-          #define BLUETOOTH_TIMEOUT (10*60)
-
-          static void *(*BluetoothHeartbeat)(void *, long long);
-          static void (*BluetoothHeartbeat_beat)(void *);
-
-          static void *(*MainWindowController_sharedInstance)();
+          # Remove fragile private Nickel symbols.
+          cc = re.sub(
+              r'/\* Stop Bluetooth heartbeat.*?'
+              r'static QEvent::Type \(\*TimeEvent_eventType\)\(\);\n',
+              '''static void *(*MainWindowController_sharedInstance)();
           static QWidget *(*MainWindowController_currentView)(void *);
-          static QObject *(*PowerManager_sharedInstance)();
-          static int (*PowerManager_filter)(QObject *, QObject *, QEvent *);
-          static QEvent::Type (*TimeEvent_eventType)();
           ''',
-          '''static void *(*MainWindowController_sharedInstance)();
-          static QWidget *(*MainWindowController_currentView)(void *);
-          '''
+              cc,
+              flags=re.S,
           )
 
-          # Remove heartbeat state from run().
-          cc = cc.replace(
-          '''\tvoid *bluetoothHeartbeat = NULL;
-          \tfd_set rfds;
-          \tstruct timeval tv;
-          \tstruct timespec last_event = { 0 };
-          \tstruct timespec now = { 0 };
-          ''',
-          '''\tfd_set rfds;
-          \tstruct timeval tv;
-          '''
+          # Remove heartbeat local variables.
+          cc = re.sub(
+              r'\tvoid \*bluetoothHeartbeat = NULL;\n'
+              r'(\tfd_set rfds;\n'
+              r'\tstruct timeval tv;\n)'
+              r'\tstruct timespec last_event = \{ 0 \};\n'
+              r'\tstruct timespec now = \{ 0 \};\n',
+              r'\1',
+              cc,
           )
 
-          # Remove heartbeat block.
+          # Remove Bluetooth heartbeat block.
           cc = re.sub(
               r'\n\t\t/\* Bluetooth heartbeat to prevent Bluetooth from turning off \*/'
               r'.*?'
-              r'\n\t\t/\* Poll devices for input events \*/',
-              '\n\n\t\t/* Poll devices for input events */',
+              r'(?=\n\t\t/\* Poll devices for input events \*/)',
+              '',
               cc,
               flags=re.S,
           )
 
-          # Remove heartbeat timestamp + PowerManager notify.
+          # Remove heartbeat timestamp / PowerManager code.
           cc = re.sub(
               r'\n\t\t\t\t\t/\* Update Bluetooth heartbeat time \*/'
               r'.*?'
-              r'\n\t\t\t\t\t/\* Invoke the configured method \*/',
-              '\n\t\t\t\t\t/* Invoke the configured method */',
+              r'(?=\n\t\t\t\t\t/\* Invoke the configured method \*/)',
+              '',
               cc,
               flags=re.S,
           )
 
-          # Fix dangling c_str pointer while we're here.
-          cc = cc.replace(
-          '''\t\t\t\t\tconst char *method = pair.second
-          \t\t\t\t\t\t.toStdString().c_str();
-          \t\t\t\t\tinvokeMainWindowController(method);
-          ''',
-          '''\t\t\t\t\tQByteArray method = pair.second.toUtf8();
-          \t\t\t\t\tinvokeMainWindowController(method.constData());
-          '''
+          # Fix temporary c_str pointer.
+          cc = re.sub(
+              r'const char \*method = pair\.second\s*'
+              r'\.toStdString\(\)\.c_str\(\);\s*'
+              r'invokeMainWindowController\(method\);',
+              '''QByteArray method = pair.second.toUtf8();
+                      invokeMainWindowController(method.constData());''',
+              cc,
           )
 
-          # Remove TimeLastUsedUpdater::notify implementation.
+          # Remove TimeLastUsedUpdater implementation.
           cc = re.sub(
-              r'\nvoid TimeLastUsedUpdater::notify\(\)\n\{.*?\n\}\n'
-              r'(?=static int btpt_init\(\))',
-              '\n',
+              r'\nvoid TimeLastUsedUpdater::notify\(\)\n'
+              r'\{.*?\n\}'
+              r'(?=\nstatic int btpt_init)',
+              '',
               cc,
               flags=re.S,
           )
 
-          # Replace init. This creates a visible marker if the plugin gets here.
+          # Replace btpt_init and create a visible diagnostic file.
           cc = re.sub(
-              r'static int btpt_init\(\)\n\{.*?\n\}\n'
-              r'(?=\nstatic struct nh_info)',
+              r'static int btpt_init\(\)\n'
+              r'\{.*?\n\}'
+              r'(?=\n\nstatic struct nh_info)',
               '''static int btpt_init()
           {
-          \tmkdir(BTPT_DIR, 0755);
+              mkdir(BTPT_DIR, 0755);
 
-          \tFILE *marker = fopen("/mnt/onboard/btpt-loaded.txt", "w");
-          \tif (marker) {
-          \t\tfputs("kobo-btpt init reached\\\\n", marker);
-          \t\tfclose(marker);
-          \t}
+              FILE *marker = fopen("/mnt/onboard/btpt-loaded.txt", "w");
+              if (marker) {
+                  fputs("kobo-btpt init reached\\n", marker);
+                  fclose(marker);
+              }
 
-          \tBluetoothPageTurner *btpt = new BluetoothPageTurner();
-          \tQObject::connect(
-          \t\tbtpt, &QThread::finished,
-          \t\tbtpt, &QObject::deleteLater);
-          \tbtpt->start();
+              BluetoothPageTurner *btpt = new BluetoothPageTurner();
 
-          \treturn 0;
-          }
-          ''',
+              QObject::connect(
+                  btpt, &QThread::finished,
+                  btpt, &QObject::deleteLater);
+
+              btpt->start();
+
+              return 0;
+          }''',
               cc,
               flags=re.S,
           )
 
-          # Keep only the two MainWindowController symbols.
+          # Keep only MainWindowController symbols.
           cc = re.sub(
-              r'static struct nh_dlsym btpt_dlsym\[\] = \{.*?\n\};'
-              r'(?=\nNickelHook)',
+              r'static struct nh_dlsym btpt_dlsym\[\] = \{.*?\n\};',
               '''static struct nh_dlsym btpt_dlsym[] = {
-          \t{
-          \t\t.name = "_ZN20MainWindowController14sharedInstanceEv",
-          \t\t.out = nh_symoutptr(MainWindowController_sharedInstance)
-          \t},
-          \t{
-          \t\t.name = "_ZNK20MainWindowController11currentViewEv",
-          \t\t.out = nh_symoutptr(MainWindowController_currentView)
-          \t},
-          \t{0},
+              {
+                  .name = "_ZN20MainWindowController14sharedInstanceEv",
+                  .out = nh_symoutptr(MainWindowController_sharedInstance)
+              },
+              {
+                  .name = "_ZNK20MainWindowController11currentViewEv",
+                  .out = nh_symoutptr(MainWindowController_currentView)
+              },
+              {0},
           };''',
               cc,
               flags=re.S,
           )
 
-          # Remove unused signal/updater class from header.
-          h = h.replace(
-          '''signals:
-          \tvoid notify();
-          };
-
-          class TimeLastUsedUpdater : public QObject
-          {
-          \tQ_OBJECT
-
-          public slots:
-          \tvoid notify();
-          };
-          ''',
-          '''};
-          '''
+          # Remove TimeLastUsedUpdater from header.
+          h = re.sub(
+              r'\n'
+              r'signals:\n'
+              r'\tvoid notify\(\);\n'
+              r'\};\n'
+              r'\n'
+              r'class TimeLastUsedUpdater : public QObject\n'
+              r'\{.*?\n'
+              r'\};',
+              '\n};',
+              h,
+              flags=re.S,
           )
 
           cc_path.write_text(cc)
           h_path.write_text(h)
 
-          print("=== Remaining fragile symbols ===")
-          for symbol in [
+          print("=== Checking patch ===")
+
+          forbidden = [
               "BluetoothHeartbeat",
               "PowerManager",
               "TimeEvent",
               "TimeLastUsedUpdater",
-          ]:
-              print(symbol, symbol in cc)
+              "emit notify",
+          ]
 
-          assert "BluetoothHeartbeat" not in cc
-          assert "PowerManager" not in cc
-          assert "TimeEvent" not in cc
-          assert "TimeLastUsedUpdater" not in cc
+          for s in forbidden:
+              print(s, "FOUND" if s in cc else "removed")
+
+          print(
+              "marker:",
+              "OK" if "btpt-loaded.txt" in cc else "MISSING"
+          )
+
+          for s in forbidden:
+              assert s not in cc, f"Still present: {s}"
+
+          assert "TimeLastUsedUpdater" not in h
+          assert "void notify();" not in h
           assert "btpt-loaded.txt" in cc
+
+          print("Patch OK")
 
       - name: Fix Linux input header
         run: |
@@ -201,7 +201,7 @@ jobs:
             ghcr.io/pgaskin/nickeltc:1.0 \
             clean all koboroot
 
-      - name: Verify
+      - name: Verify KoboRoot
         run: |
           ls -lh KoboRoot.tgz
           test -f KoboRoot.tgz
